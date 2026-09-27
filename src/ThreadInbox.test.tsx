@@ -53,6 +53,9 @@ const defaultSidebarSettings = {
   autoSettleInactive: true,
   autoSettleAfterDays: 3,
   autoSettleOnMerge: true,
+  childSortField: "created",
+  childSortDirection: "ascending",
+  childIconStyle: "disc",
 };
 
 function thread(
@@ -176,6 +179,39 @@ it("shows direct subthreads in the hover card and opens them by keyboard or clic
   fireEvent.click(within(reopened).getByRole("button", { name: "Open subthread: Review" }));
   expect(rendered.sidebarActionCalls).toContainEqual({ method: "open", threadId: "b" });
   expect(screen.queryByRole("dialog", { name: "Thread details" })).toBeNull();
+});
+
+it("orders hover card subthreads by the saved child sort", async () => {
+  renderSlot(inbox, listProps, {
+    sidebarThreads: {
+      status: "ready",
+      threads: [
+        thread({ id: "parent", title: "Parent work" }),
+        thread({ id: "old", parentThreadId: "parent", title: "Old", createdAt: 10 }),
+        thread({ id: "new", parentThreadId: "parent", title: "New", createdAt: 20 }),
+      ],
+      projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+    },
+    providers: { status: "ready", providers: defaultProviders },
+    rpc: {
+      getSidebarSettings: () => ({
+        ...defaultSidebarSettings,
+        inactiveThreadsEnabled: false,
+        childSortDirection: "descending",
+      }),
+      listLifecycle: () => ({ rows: [] }),
+    },
+  });
+  const row = await screen.findByRole("link", { name: "Parent work" });
+  act(() => row.focus());
+  const details = await screen.findByRole("dialog", { name: "Thread details" });
+  fireEvent.click(within(details).getByRole("button", { name: "Subthreads (2)" }));
+  await waitFor(() => {
+    const list = within(details).getByRole("list", { name: "Subthreads" });
+    expect(within(list).getAllByRole("button").map((item) => item.getAttribute("aria-label"))).toEqual([
+      "Open subthread: New", "Open subthread: Old",
+    ]);
+  });
 });
 
 it("shows port details in the thread hover card", async () => {
@@ -444,6 +480,7 @@ describe("sidebar settings", () => {
     });
 
     expect(await screen.findByText("Thread organization")).toBeDefined();
+    expect(screen.getByText("Child threads")).toBeDefined();
     expect(screen.getByText("Automatic cleanup")).toBeDefined();
     expect(screen.getByText("Project icons")).toBeDefined();
     expect(
@@ -463,12 +500,24 @@ describe("sidebar settings", () => {
     fireEvent.click(
       screen.getByRole("switch", { name: "Show children that need attention" }),
     );
+    fireEvent.change(screen.getByLabelText("Child threads sort field"), {
+      target: { value: "activity" },
+    });
+    fireEvent.change(screen.getByLabelText("Child threads sort direction"), {
+      target: { value: "descending" },
+    });
+    fireEvent.change(screen.getByLabelText("Child thread icon"), {
+      target: { value: "provider" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() =>
       expect(saved).toEqual({
         ...defaultSidebarSettings,
         snoozePresets: "1h, Wait refresh=5h, Tonight=evening@20:00, Morning=tomorrow@08:30, Monday=next-week@10:00",
         showRunningChildrenWhenCollapsed: false,
+        childSortField: "activity",
+        childSortDirection: "descending",
+        childIconStyle: "provider",
       }),
     );
   });
@@ -558,6 +607,38 @@ describe("sidebar settings", () => {
       }),
     );
     expect(screen.getByText("brand.svg")).toBeDefined();
+  });
+
+  it("keeps a settings cache written before the child-thread settings", () => {
+    const previous: Record<string, unknown> = {
+      ...defaultSidebarSettings,
+      inactiveAfterHours: 12,
+    };
+    delete previous.childSortField;
+    delete previous.childSortDirection;
+    delete previous.childIconStyle;
+    window.localStorage.setItem(
+      "bb-sidebar:settings-cache:v1",
+      JSON.stringify(previous),
+    );
+    renderSlot(sidebarSettings, {}, {
+      rpc: {
+        getSidebarSettings: () => new Promise(() => {}),
+        listProjectIconSettings: () => ({ projects: [] }),
+      },
+    });
+
+    expect(screen.queryByText("Loading settings...")).toBeNull();
+    expect(
+      (screen.getByLabelText("Hours before inactive") as HTMLInputElement).value,
+    ).toBe("12");
+    expect(
+      (screen.getByLabelText("Child threads sort field") as HTMLSelectElement)
+        .value,
+    ).toBe("created");
+    expect(
+      (screen.getByLabelText("Child thread icon") as HTMLSelectElement).value,
+    ).toBe("disc");
   });
 
   it("preserves unsaved settings when a realtime refresh arrives", async () => {
@@ -1446,6 +1527,145 @@ describe("ThreadInbox", () => {
         screen.queryByRole("list", { name: "Child threads" }),
       ).toBeNull(),
     );
+  });
+
+  it("orders child rows by the saved child sort", async () => {
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [
+          thread({ id: "parent", title: "Parent" }),
+          thread({
+            id: "old",
+            title: "Old child",
+            parentThreadId: "parent",
+            createdAt: 10,
+            indicator: "runtime",
+          }),
+          thread({
+            id: "new",
+            title: "New child",
+            parentThreadId: "parent",
+            createdAt: 20,
+            indicator: "runtime",
+          }),
+        ],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+      },
+      providers: { status: "ready", providers: defaultProviders },
+      rpc: {
+        getSidebarSettings: () => ({
+          ...defaultSidebarSettings,
+          inactiveThreadsEnabled: false,
+          childSortDirection: "descending",
+        }),
+        listLifecycle: () => ({ rows: [] }),
+      },
+    });
+
+    await waitFor(() => {
+      const rows = within(
+        screen.getByRole("list", { name: "Child threads" }),
+      ).getAllByText(/child$/);
+      expect(rows.map((row) => row.textContent)).toEqual([
+        "New child",
+        "Old child",
+      ]);
+    });
+  });
+
+  it("shows provider icons for child threads when chosen", async () => {
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [
+          thread({ id: "parent", title: "Parent" }),
+          thread({
+            id: "codex-child",
+            title: "Codex child",
+            parentThreadId: "parent",
+            providerId: "codex",
+            indicator: "runtime",
+          }),
+          thread({
+            id: "claude-child",
+            title: "Claude child",
+            parentThreadId: "parent",
+            providerId: "claude-code",
+            indicator: "runtime",
+          }),
+        ],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+      },
+      providers: { status: "ready", providers: defaultProviders },
+      rpc: {
+        getSidebarSettings: () => ({
+          ...defaultSidebarSettings,
+          inactiveThreadsEnabled: false,
+          childIconStyle: "provider",
+        }),
+        listLifecycle: () => ({ rows: [] }),
+      },
+    });
+
+    await waitFor(() => {
+      const childList = screen.getByRole("list", { name: "Child threads" });
+      expect(
+        within(childList).getByRole("img", { name: "Codex" }),
+      ).toBeDefined();
+      expect(
+        within(childList).getByRole("img", { name: "Claude Code" }),
+      ).toBeDefined();
+    });
+  });
+
+  it("ignores a settings load that answers after a newer one", async () => {
+    const stale = deferred<typeof defaultSidebarSettings>();
+    let loads = 0;
+    const rendered = renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [
+          thread({ id: "parent", title: "Parent" }),
+          thread({
+            id: "working",
+            title: "Working child",
+            parentThreadId: "parent",
+            indicator: "runtime",
+          }),
+        ],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+      },
+      rpc: {
+        getSidebarSettings: () => {
+          loads += 1;
+          return loads === 1
+            ? stale.promise
+            : {
+                ...defaultSidebarSettings,
+                showRunningChildrenWhenCollapsed: false,
+              };
+        },
+        listLifecycle: () => ({ rows: [] }),
+      },
+    });
+
+    await rendered.emitRealtime("sidebar-settings", {});
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("list", { name: "Child threads" }),
+      ).toBeNull(),
+    );
+
+    stale.resolve(defaultSidebarSettings);
+    await stale.promise;
+    await waitFor(() => expect(loads).toBe(2));
+    expect(screen.queryByRole("list", { name: "Child threads" })).toBeNull();
+    expect(
+      JSON.parse(
+        window.localStorage.getItem("bb-sidebar:settings-cache:v1") ?? "{}",
+      ).showRunningChildrenWhenCollapsed,
+    ).toBe(false);
   });
 
   it("highlights the active grandchild row", () => {

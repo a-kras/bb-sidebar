@@ -25,23 +25,32 @@ import {
   childSubtree,
   type ChildStatusKind,
 } from "./child-status";
+import { childThreadSortOf, type ChildThreadSort } from "./sidebar-settings";
+import {
+  ChildThreadIcon,
+  compareChildThreads,
+  useChildThreadDisplay,
+} from "./ChildThreadDisplay";
+import { ProviderGlyph } from "./ProviderGlyph";
 
 const MAX_CHILD_DOTS = 3;
 
 export function childrenOf(
   threads: readonly PluginSidebarThread[],
   parentThreadId: string,
+  sort: ChildThreadSort = childThreadSortOf(null),
 ): PluginSidebarThread[] {
   return threads
     .filter(
       (thread) =>
         !thread.isArchived && thread.parentThreadId === parentThreadId,
     )
-    .sort((left, right) => left.createdAt - right.createdAt);
+    .sort(compareChildThreads(sort));
 }
 
 export function childThreadsByParent(
   threads: readonly PluginSidebarThread[],
+  sort: ChildThreadSort = childThreadSortOf(null),
 ): ReadonlyMap<string, readonly PluginSidebarThread[]> {
   const result = new Map<string, PluginSidebarThread[]>();
   for (const thread of threads) {
@@ -51,7 +60,7 @@ export function childThreadsByParent(
     result.set(thread.parentThreadId, siblings);
   }
   for (const siblings of result.values()) {
-    siblings.sort((left, right) => left.createdAt - right.createdAt);
+    siblings.sort(compareChildThreads(sort));
   }
   return result;
 }
@@ -126,7 +135,27 @@ export function ChildThreadDots({
   threads: readonly PluginSidebarThread[];
   compact?: boolean;
 }) {
+  const { iconStyle, providerById } = useChildThreadDisplay();
   const visibleThreads = threads.filter((thread) => !thread.isArchived);
+  if (iconStyle === "provider") {
+    // One glyph per agent: three identical logos would say nothing.
+    const providerIds = [
+      ...new Set(visibleThreads.map((thread) => thread.providerId)),
+    ].slice(0, MAX_CHILD_DOTS);
+    return (
+      <span className="flex shrink-0 items-center gap-0.5" aria-hidden>
+        {providerIds.map((providerId) => (
+          <span key={providerId} data-child-thread-dot="">
+            <ProviderGlyph
+              providerId={providerId}
+              provider={providerById.get(providerId) ?? null}
+              className={compact ? "size-3 [&_span]:size-2.5" : undefined}
+            />
+          </span>
+        ))}
+      </span>
+    );
+  }
   return (
     <span className="flex shrink-0 items-center" aria-hidden>
       {visibleThreads.slice(0, MAX_CHILD_DOTS).map((thread, index) => (
@@ -291,7 +320,7 @@ export function ChildThreadList({
         "flex flex-col",
         variant === "header"
           ? "gap-px p-1.5 pt-0.5"
-          : "ml-[21px] mt-1 border-l-[1.5px] border-border pl-3",
+          : "ml-2.5 mt-1 border-l-[1.5px] border-border pl-1",
       )}
     >
       {visibleThreads.map((child) => {
@@ -451,9 +480,11 @@ function ChildThreadRow({
                 : "h-full gap-2 rounded-md pl-2",
             )}
           >
-            <Disc
+            <ChildThreadIcon
               thread={thread}
-              className={variant === "header" ? undefined : "size-2 border-0"}
+              discClassName={
+                variant === "header" ? undefined : "size-2 border-0"
+              }
             />
             <span
               className={cn(
