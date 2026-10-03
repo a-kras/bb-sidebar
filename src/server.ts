@@ -31,17 +31,17 @@ import {
   CHILD_THREAD_ICON_STYLES,
   CHILD_THREAD_SORT_DIRECTIONS,
   CHILD_THREAD_SORT_FIELDS,
+  childThreadSettingsOf,
   DEFAULT_SIDEBAR_SETTINGS,
   SIDEBAR_SETTINGS_CHANNEL,
-  type ChildThreadIconStyle,
-  type ChildThreadSortDirection,
-  type ChildThreadSortField,
   type SidebarSettingsValues,
 } from "./sidebar-settings";
 import { configuredSnoozePresetError } from "./lifecycle";
 import { portSnapshotSchema } from "./open-ports";
 import { createPortDiscovery } from "./port-discovery";
 import { createThreadPortActions } from "./thread-ports";
+import { createThreadPullRequests } from "./thread-pull-requests";
+import { threadPullRequestSchema } from "./pull-requests";
 import { ownedPortTargetSchema, closePortsResultSchema } from "./close-owned-ports";
 
 const migrations = [
@@ -205,9 +205,17 @@ export const bbSidebarRpcContract = defineRpcContract({
     input: threadIdSchema.extend({ ports: z.array(ownedPortTargetSchema).min(1).max(1000) }),
     output: closePortsResultSchema,
   },
+  stopWorkspacePort: {
+    input: threadIdSchema.extend({ port: ownedPortTargetSchema }).strict(),
+    output: closePortsResultSchema,
+  },
   getOpenPorts: {
     input: z.object({}).strict(),
     output: portSnapshotSchema,
+  },
+  getThreadPullRequests: {
+    input: threadIdSchema.strict(),
+    output: z.object({ pullRequests: z.array(threadPullRequestSchema) }).strict(),
   },
   getThreadExecutionDetails: {
     input: threadIdSchema.strict(),
@@ -470,6 +478,7 @@ function iconMimeType(path: string, reported: string): string {
 export default async function plugin(bb: BbPluginApi) {
   const getOpenPorts = createPortDiscovery(bb);
   const threadPortActions = createThreadPortActions(bb);
+  const threadPullRequests = createThreadPullRequests(bb);
   const regenerateTitle = createTitleRegenerator(bb);
   const db = bb.storage.database();
   bb.storage.migrate(db, migrations);
@@ -496,21 +505,11 @@ export default async function plugin(bb: BbPluginApi) {
           autoSettleInactive: row.auto_settle_inactive === 1,
           autoSettleAfterDays: row.auto_settle_after_days,
           autoSettleOnMerge: row.auto_settle_on_merge === 1,
-          childSortField: CHILD_THREAD_SORT_FIELDS.includes(
-            row.child_sort_field as ChildThreadSortField,
-          )
-            ? (row.child_sort_field as ChildThreadSortField)
-            : DEFAULT_SIDEBAR_SETTINGS.childSortField,
-          childSortDirection: CHILD_THREAD_SORT_DIRECTIONS.includes(
-            row.child_sort_direction as ChildThreadSortDirection,
-          )
-            ? (row.child_sort_direction as ChildThreadSortDirection)
-            : DEFAULT_SIDEBAR_SETTINGS.childSortDirection,
-          childIconStyle: CHILD_THREAD_ICON_STYLES.includes(
-            row.child_icon_style as ChildThreadIconStyle,
-          )
-            ? (row.child_icon_style as ChildThreadIconStyle)
-            : DEFAULT_SIDEBAR_SETTINGS.childIconStyle,
+          ...childThreadSettingsOf({
+            childSortField: row.child_sort_field,
+            childSortDirection: row.child_sort_direction,
+            childIconStyle: row.child_icon_style,
+          }),
         }
       : { ...DEFAULT_SIDEBAR_SETTINGS };
   };
@@ -965,20 +964,25 @@ export default async function plugin(bb: BbPluginApi) {
     inboxThreadIds.forEach((threadId, index) => insert.run(threadId, index));
   });
 
+  // Project rows, not plain thread rows: only they carry every kind of live
+  // work the sidebar checks (workflows, background commands, plan mode, goals,
+  // a pending interaction, queued messages). One unpaged request covers the
+  // same unarchived, visible threads the old paged thread list did.
   const loadPolicyThreads = async () => {
-    const threads: Awaited<ReturnType<typeof bb.sdk.threads.list>> = [];
-    const pageSize = 500;
-    for (let offset = 0; ; offset += pageSize) {
-      const page = await bb.sdk.threads.list({
-        archived: false,
-        includeHidden: false,
-        limit: pageSize,
-        offset,
-      });
-      threads.push(...page);
-      if (page.length < pageSize) break;
-    }
-    return threads;
+    const projects = await bb.sdk.projects.list({
+      include: "threads",
+      includePersonal: true,
+    });
+    return projects.flatMap((project) =>
+      "threads" in project
+        ? project.threads.filter(
+            (thread) =>
+              thread.archivedAt === null &&
+              thread.deletedAt === null &&
+              thread.visibility === "visible",
+          )
+        : [],
+    );
   };
 
   const loadPullRequests = async (environmentIds: readonly string[]) => {
@@ -1134,25 +1138,45 @@ export default async function plugin(bb: BbPluginApi) {
         ),
         onMerge: configured.autoSettleOnMerge,
       };
-      const changes = threads.flatMap((thread) => {
-        // Re-read after PR lookups so a concurrent Park action wins.
-        const row = readOne(thread.id);
-        const decision = decideAutoSettle({
-          lifecycle: row,
-          now,
-          pullRequest:
-            thread.environmentId === null
-              ? { outcome: "absent" }
-              : (pullRequests.get(thread.environmentId) ?? {
-                  outcome: "unknown",
-                }),
-          settings: policySettings,
-          thread,
+      const decide = (keepThreadIds: ReadonlySet<string>) =>
+        threads.flatMap((thread) => {
+          if (keepThreadIds.has(thread.id)) return [];
+          // Re-read after every lookup so a concurrent Park action wins.
+          const row = readOne(thread.id);
+          const decision = decideAutoSettle({
+            lifecycle: row,
+            now,
+            pullRequest:
+              thread.environmentId === null
+                ? { outcome: "absent" }
+                : (pullRequests.get(thread.environmentId) ?? {
+                    outcome: "unknown",
+                  }),
+            settings: policySettings,
+            thread,
+          });
+          return decision === "keep"
+            ? []
+            : [{ decision, row, threadId: thread.id }];
         });
-        return decision === "keep"
-          ? []
-          : [{ decision, row, threadId: thread.id }];
-      });
+      let changes = decide(new Set());
+      // Settling stops the runtime, which kills what its agent left running in
+      // the background, and bb cannot see that work when the provider does not
+      // report it. A thread still serving a port, such as a dev server, stays
+      // out of policy reach until it stops.
+      const settling = new Set(
+        changes.flatMap((change) =>
+          change.decision === "settle" ? [change.threadId] : [],
+        ),
+      );
+      if (settling.size > 0) {
+        changes = decide(
+          await threadPortActions.threadsServingPorts(
+            threads.filter((thread) => settling.has(thread.id)),
+            threads,
+          ),
+        );
+      }
       if (changes.length === 0) return [];
       applyPolicyChanges(changes, now);
       const changedThreadIds = changes.map((change) => change.threadId);
@@ -1192,12 +1216,20 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(bbSidebarRpcContract, {
     getOpenPorts,
     getThreadPorts: threadPortActions.getThreadPorts,
+    getThreadPullRequests: threadPullRequests.getThreadPullRequests,
     async closeThreadPorts(input) {
       if (readOne(input.threadId)?.settledOverride !== "settled") {
         throw new Error("Thread is no longer settled");
       }
       try {
         return await threadPortActions.closeThreadPorts(input);
+      } finally {
+        getOpenPorts.invalidate();
+      }
+    },
+    async stopWorkspacePort({ threadId, port }) {
+      try {
+        return await threadPortActions.closeThreadPorts({ threadId, ports: [port], scope: "workspace" });
       } finally {
         getOpenPorts.invalidate();
       }

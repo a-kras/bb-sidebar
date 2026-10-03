@@ -1,4 +1,7 @@
-import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
+import type {
+  PluginSidebarThread,
+  PluginSidebarThreadActivity,
+} from "@get-bb/plugin-sdk";
 
 /**
  * The parked / settled / snoozed lifecycle, as pure functions over stored rows.
@@ -25,6 +28,8 @@ export interface ThreadLifecycleRow {
 /** The activity signals that outrank a user's parking decision. */
 export interface ThreadActivitySignals {
   hasPendingInteraction: boolean;
+  /** A message waits to be sent, or one failed to send. */
+  hasQueuedWork: boolean;
   /** Any live work: runtime, workflows, background agents, plan, goals. */
   isWorking: boolean;
   isUnread: boolean;
@@ -60,39 +65,86 @@ export function resolveWakeReason(
 }
 
 /**
- * Whether a thread may be parked at all.
+ * Whether a thread may be parked at all: the one rule manual parking and
+ * automatic settle share.
  *
  * bb has more kinds of live work than a single session status — workflows,
  * background agents, background commands, plan mode, goals — and every one of
  * them must block parking. Hiding a thread that is still working is the one
- * failure this feature cannot afford.
+ * failure this feature cannot afford. A queued message is work about to
+ * start, and a failed one is something the user has not seen go nowhere yet.
  */
-export function canPark(signals: ThreadActivitySignals): boolean {
-  return !signals.hasPendingInteraction && !signals.isWorking;
+export function canPark(
+  signals: Pick<
+    ThreadActivitySignals,
+    "hasPendingInteraction" | "hasQueuedWork" | "isWorking"
+  >,
+): boolean {
+  return (
+    !signals.hasPendingInteraction &&
+    !signals.hasQueuedWork &&
+    !signals.isWorking
+  );
 }
 
-/** Any live work at all, which blocks parking and wakes a parked thread. */
-export function isThreadWorking(thread: PluginSidebarThread): boolean {
-  const { activity } = thread;
+/** A turn bb has accepted and not yet finished, in either thread view. */
+export function isTurnInFlight(status: PluginSidebarThread["status"]): boolean {
   return (
+    status === "active" ||
+    status === "pending" ||
+    status === "starting" ||
+    status === "stopping"
+  );
+}
+
+/**
+ * Any live work at all: a turn in flight or any of bb's activity counters.
+ *
+ * The one definition the sidebar and automatic settle share. They read it from
+ * different bb views, so each passes its own turn signal, but the counters
+ * that make a thread busy must never differ between them.
+ */
+export function hasLiveWork(
+  activity: PluginSidebarThreadActivity,
+  turnInFlight: boolean,
+): boolean {
+  return (
+    turnInFlight ||
     activity.workflows > 0 ||
     activity.backgroundAgents > 0 ||
     activity.backgroundCommands > 0 ||
     activity.planMode > 0 ||
-    activity.goals > 0 ||
-    thread.indicator === "runtime" ||
-    thread.indicator === "working-draft"
+    activity.goals > 0
   );
+}
+
+/** Any live work at all, which blocks parking and wakes a parked thread. */
+export function isThreadWorking(thread: PluginSidebarThread): boolean {
+  // The turn status as well as the indicator: bb paints attention before
+  // work, so an unread thread whose turn is still running shows no runtime
+  // indicator, while a monitor keeps the runtime indicator between turns.
+  return hasLiveWork(
+    thread.activity,
+    isTurnInFlight(thread.status) || thread.indicator === "runtime",
+  );
+}
+
+/** The parking signals for a sidebar thread. */
+export function sidebarThreadSignals(
+  thread: PluginSidebarThread,
+): ThreadActivitySignals {
+  return {
+    hasPendingInteraction: thread.hasPendingInteraction,
+    hasQueuedWork: thread.queuedWork !== "none",
+    isWorking: isThreadWorking(thread),
+    isUnread: thread.isUnread,
+    latestAttentionAt: thread.latestAttentionAt,
+  };
 }
 
 /** Whether a sidebar thread is idle enough for archive and parking actions. */
 export function canParkThread(thread: PluginSidebarThread): boolean {
-  return canPark({
-    hasPendingInteraction: thread.hasPendingInteraction,
-    isWorking: isThreadWorking(thread),
-    isUnread: thread.isUnread,
-    latestAttentionAt: thread.latestAttentionAt,
-  });
+  return canPark(sidebarThreadSignals(thread));
 }
 
 /**

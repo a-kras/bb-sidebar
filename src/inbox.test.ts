@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
+import { idleSidebarThreadFields } from "./test-fixtures";
 import {
   childNeedsYouCount,
   childThreadsByParent,
@@ -24,6 +25,7 @@ function thread(
   overrides: Partial<PluginSidebarThread> = {},
 ): PluginSidebarThread {
   return {
+    ...idleSidebarThreadFields,
     id: "thr_1",
     projectId: "proj_1",
     title: "A thread",
@@ -310,6 +312,18 @@ describe("child threads", () => {
       { field: "created", direction: "descending" },
     );
     expect(children.get("parent")?.map((t) => t.id)).toEqual(["b", "a"]);
+  });
+
+  it("breaks child sort ties by id, whatever the input order", () => {
+    const threads = [
+      thread({ id: "parent" }),
+      thread({ id: "b", parentThreadId: "parent", createdAt: 10 }),
+      thread({ id: "a", parentThreadId: "parent", createdAt: 10 }),
+    ];
+    expect(childrenOf(threads, "parent").map((t) => t.id)).toEqual(["a", "b"]);
+    expect(
+      childrenOf([...threads].reverse(), "parent").map((t) => t.id),
+    ).toEqual(["a", "b"]);
   });
 
   it("excludes archived children from child helpers and attention counts", () => {

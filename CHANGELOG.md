@@ -2,6 +2,78 @@
 
 ## Unreleased
 
+## [0.2.27] - 2026-10-01
+
+### Added
+
+- A project without an icon shows a letter tile: its first letter on a colour picked from its name, so it looks the same on every machine. Common leading words such as `bb-` are skipped, so `bb-sidebar` shows **S**. The tile also shows while an icon is loading, in the hover card in place of the folder glyph, and in the Project icon settings preview.
+- A row shows **Send failed** when a queued message could not be sent, and **Queued** when a message is waiting to send on an otherwise quiet thread, such as a scheduled send. These rows used to show only their age. A failed send also counts as failed in a parent's child summary.
+- A pull request in GitHub's merge queue shows **In merge queue**.
+
+### Changed
+
+- Sorting Active by project gives a header only to projects with two or more Active threads. A project with one Active thread stays an ordinary card, so a list without repeated projects reads like manual order.
+- Project groups and single cards follow your manual order, with each group drawn where its first thread sits. Dragging a project header, or pressing Alt+Up or Alt+Down on it, moves the whole group; threads inside a group reorder among themselves.
+- Collapsing Active also hides the project headers, leaving only the open thread.
+- Requires plugin SDK 0.6.5 or newer.
+
+### Fixed
+
+- Automatic settle no longer settles, or stops the runtime of, a thread that is still waiting on you or has live work: a question or approval, queued messages, a workflow, a background agent or command, plan mode, or a goal. It now uses the same rule as the sidebar's **Settle** action.
+- Automatic settle no longer settles a thread that is still serving a port from its workspace, such as a dev server. Settling stops the thread's runtime, which also stops processes its agent left running, and some providers do not tell bb about them. A thread whose machine cannot be checked is left alone until the next pass.
+- **Settle**, **Park**, and **Snooze** are no longer offered for a thread with a queued or failed message, or for an unread thread whose turn is still running. Settled, parked, and snoozed threads in either state return to Active.
+- **Regenerate title** works again on current bb, which no longer exposes the inference model it read. It now generates the title with the thread's own agent and model, at low reasoning.
+
+## [0.2.26] - 2026-09-29
+
+### Added
+
+- Holding Cmd (Ctrl off Mac) labels the first nine rows with bb's own shortcut hints, ⌘ 1 to ⌘ 9, in place of their status. They appear on the same hold delay as bb's hints and match the row each Cmd+digit shortcut opens.
+- Each process in a hover card's **Workspace ports** list has a stop button. The first click arms it; a second click within four seconds stops the process.
+
+### Changed
+
+- The **Workspace ports** list in a hover card starts collapsed. Click its header to show the ports.
+
+## [0.2.25] - 2026-09-28
+
+### Changed
+
+- Sorting Active by project now shows each project's name once, in a header with its icon and thread count, instead of on every card. Cards under a header are a line shorter: the title sits beside the status.
+
+### Added
+
+- Project headers collapse. The choice is remembered, and a collapsed project still shows the open thread.
+
+## [0.2.24] - 2026-09-27
+
+### Fixed
+
+- A thread's hover card no longer lists pull requests from commands that only mention `gh pr create`, such as a search of another thread's log. Only commands that run it count.
+
+## [0.2.23] - 2026-09-27
+
+### Added
+
+- Hover cards have a collapsible **Pull requests** section listing every pull request a thread opened with `gh pr create`, newest first, with each PR's title and status. Before, only the PR on the thread's current branch was shown. Status comes from `gh` on the thread's machine; without it, the list still shows PR numbers and links. In a shared project checkout, a thread lists only the PRs it opened, not the checkout branch's PR.
+
+## [0.2.22] - 2026-09-27
+
+### Added
+
+- A **Child threads** settings section. **Sort** orders child threads by date created or last activity, ascending or descending, in the sidebar, the thread header popup, the parent's badge, and hover cards. **Child thread icon** shows a colour circle per thread (the default) or the agent's provider icon; with provider icons, the parent's badge shows each agent once. The defaults keep the previous look and oldest-first order.
+
+### Improved
+
+- The child-thread tree line sits under the parent's title, and child rows sit closer to it.
+
+### Fixed
+
+- A slow, older settings load arriving after a newer one no longer rolls the sidebar back to the previous settings.
+- The thread header's child-thread popup stays inside the window and scrolls a long list instead of running off screen.
+
+Thanks to [@a-kras](https://github.com/a-kras) for designing and contributing the child-thread settings and the settings-load fix in [#3](https://github.com/yusuf8834/bb-sidebar/pull/3).
+
 ## [0.2.21] - 2026-09-23
 
 ### Added
@@ -119,6 +191,8 @@
 - Keep snooze, settle, and restore actions visible on touch devices, with parked thread labels and snooze countdowns beside the restore button.
 - Group the unpin button with card actions, or with the status and Woke label when parking actions are unavailable.
 - Keep the status visible when focusing Unpin on cards without parking actions.
+
+Thanks to [@banjerluke](https://github.com/banjerluke) for contributing the touch-device fix in [#2](https://github.com/yusuf8834/bb-sidebar/pull/2).
 
 ## [0.2.11] - 2026-09-11
 

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
+import { idleSidebarThreadFields } from "./test-fixtures";
 import type { SidebarProvider } from "./ProviderGlyph";
 
 const app = await loadPluginApp(() => import("../app"));
@@ -14,6 +15,7 @@ function thread(
   overrides: Partial<PluginSidebarThread> = {},
 ): PluginSidebarThread {
   return {
+    ...idleSidebarThreadFields,
     id: "thr_1",
     projectId: "proj_1",
     title: "A thread",
@@ -52,6 +54,7 @@ function provider(id: string, displayName: string): SidebarProvider {
     pluginId: `provider-${id}`,
     displayName,
     available: true,
+    completedTurnDisplay: "collapse",
     maintenance: { health: true, usage: false, installation: true },
     logoUrl: `/api/v1/system/providers/${id}/logo`,
     capabilities: {
@@ -123,7 +126,7 @@ describe("SubagentsChip", () => {
         sidebarThreads: {
           status: "ready",
           threads: [thread({ id: "child", title: "Child", parentThreadId: "parent" })],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
         rpc: {
           getThreadExecutionDetails: (input) => {
@@ -160,7 +163,7 @@ describe("SubagentsChip", () => {
             thread({ id: "child", title: "Child", parentThreadId: "parent" }),
             thread({ id: "grandchild", title: "Grandchild", parentThreadId: "child" }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -211,7 +214,7 @@ describe("SubagentsChip", () => {
               createdAt: 102,
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -277,7 +280,7 @@ describe("SubagentsChip", () => {
               createdAt: 104,
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -321,7 +324,7 @@ describe("SubagentsChip", () => {
               createdAt: 102,
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -369,7 +372,7 @@ describe("SubagentsChip", () => {
               parentThreadId: "child",
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -413,7 +416,7 @@ describe("SubagentsChip", () => {
     });
   });
 
-  it("closes on Escape and restores focus to the trigger", () => {
+  it("closes on Escape and restores focus to the trigger", async () => {
     renderSlot(
       childrenChip,
       { threadId: "parent", projectId: "proj_1", isCompactViewport: false },
@@ -428,7 +431,7 @@ describe("SubagentsChip", () => {
               parentThreadId: "parent",
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
       },
     );
@@ -440,7 +443,36 @@ describe("SubagentsChip", () => {
     fireEvent.keyDown(document, { key: "Escape" });
 
     expect(screen.queryByRole("region", { name: "Child threads" })).toBeNull();
-    expect(document.activeElement).toBe(trigger);
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it("closes when clicking outside the popup", async () => {
+    renderSlot(
+      childrenChip,
+      { threadId: "parent", projectId: "proj_1", isCompactViewport: false },
+      {
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            thread({ id: "parent", title: "Parent" }),
+            thread({ id: "child", title: "Child", parentThreadId: "parent" }),
+          ],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "1 child thread" }));
+    const popup = screen.getByRole("region", { name: "Child threads" });
+    fireEvent.pointerDown(popup);
+    expect(screen.getByRole("region", { name: "Child threads" })).toBeDefined();
+
+    const outside = document.body.appendChild(document.createElement("div"));
+    await waitFor(() => {
+      fireEvent.pointerDown(outside, { pointerType: "mouse" });
+      fireEvent.click(outside);
+      expect(screen.queryByRole("region", { name: "Child threads" })).toBeNull();
+    });
   });
 
   it("ignores a settings load that answers after a newer one", async () => {
@@ -453,7 +485,7 @@ describe("SubagentsChip", () => {
         sidebarThreads: {
           status: "ready",
           threads: orderedChildren,
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
         rpc: {
           getSidebarSettings: () => {
@@ -501,7 +533,7 @@ describe("SubagentsChip", () => {
         sidebarThreads: {
           status: "ready",
           threads: orderedChildren,
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
         rpc: { getSidebarSettings: () => remoteSettings },
       },
@@ -546,7 +578,7 @@ describe("SubagentsChip", () => {
               providerId: "claude-code",
             }),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
         providers: { status: "ready", providers },
         rpc: {
@@ -587,7 +619,7 @@ describe("SubagentsChip", () => {
                 }),
             ),
           ],
-          projects: [{ id: "proj_1", name: "bb", isPersonal: false }],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
         },
         providers: { status: "ready", providers },
         rpc: {

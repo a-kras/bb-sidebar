@@ -3,6 +3,7 @@ import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import plugin, { type StoredLifecycleRow } from "./server";
 
 interface LifecycleListResult {
@@ -32,6 +33,62 @@ function standardProject() {
       },
     ],
   };
+}
+
+type ProjectThread = Extract<
+  Awaited<ReturnType<BbPluginApi["sdk"]["projects"]["list"]>>[number],
+  { threads: unknown }
+>["threads"][number];
+
+/** A thread as bb's project list reports it, idle unless overridden. */
+function projectThread(
+  overrides: Partial<ProjectThread> & { id: string },
+): ProjectThread {
+  return {
+    activity: {
+      activeBackgroundAgentCount: 0,
+      activeBackgroundCommandCount: 0,
+      activeGoalCount: 0,
+      activePlanModeCount: 0,
+      activeWorkflowCount: 0,
+    },
+    archivedAt: null,
+    createdAt: 1,
+    deletedAt: null,
+    environmentBranchName: null,
+    environmentHostId: null,
+    environmentId: null,
+    environmentIsWorktree: null,
+    environmentName: null,
+    environmentPath: null,
+    environmentProviderId: null,
+    environmentWorkspaceDisplayKind: "other",
+    hasPendingInteraction: false,
+    lastReadAt: null,
+    latestAttentionAt: 1,
+    lifecycleOwnerThreadId: null,
+    originKind: null,
+    originPluginId: null,
+    parentThreadId: null,
+    pinSortKey: null,
+    pinnedAt: null,
+    projectId: "proj_1",
+    providerId: "codex",
+    queuedWork: "none",
+    runtime: { displayStatus: "idle" },
+    sectionId: null,
+    sourceThreadId: null,
+    status: "idle",
+    title: null,
+    titleFallback: null,
+    updatedAt: 1,
+    visibility: "visible",
+    ...overrides,
+  };
+}
+
+function projectsWith(threads: ProjectThread[]) {
+  return [{ ...standardProject(), defaultExecutionOptions: null, threads }];
 }
 
 function terminalSession(
@@ -1025,16 +1082,17 @@ describe("automatic settle evaluation", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: {
-          list: async () => [
-            makeThreadResponse({
+        projects: {
+          list: async () =>
+            projectsWith([
+            projectThread({
               id: "thr_old",
               createdAt: old,
               updatedAt: old,
               latestAttentionAt: old,
               status: "idle",
             }),
-          ],
+            ]),
         },
       },
     });
@@ -1061,20 +1119,125 @@ describe("automatic settle evaluation", () => {
     });
   });
 
+  it("never settles or stops idle threads that still have live work", async () => {
+    const old = Date.now() - 4 * 24 * 60 * 60 * 1_000;
+    const quiet = { createdAt: old, updatedAt: old, latestAttentionAt: old };
+    const idleActivity = {
+      activeBackgroundAgentCount: 0,
+      activeBackgroundCommandCount: 0,
+      activeGoalCount: 0,
+      activePlanModeCount: 0,
+      activeWorkflowCount: 0,
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "bb-sidebar",
+      sdk: {
+        projects: {
+          list: async () =>
+            projectsWith([
+              projectThread({ id: "thr_quiet", ...quiet }),
+              projectThread({ id: "thr_asking", ...quiet, hasPendingInteraction: true }),
+              projectThread({ id: "thr_queued", ...quiet, queuedWork: "waiting" }),
+              projectThread({
+                id: "thr_workflow",
+                ...quiet,
+                activity: { ...idleActivity, activeWorkflowCount: 1 },
+              }),
+              projectThread({
+                id: "thr_command",
+                ...quiet,
+                activity: { ...idleActivity, activeBackgroundCommandCount: 1 },
+              }),
+              projectThread({ id: "thr_archived", ...quiet, archivedAt: old }),
+              projectThread({ id: "thr_hidden", ...quiet, visibility: "hidden" }),
+            ]),
+        },
+      },
+    });
+    await plugin(bb);
+    disposers.push(() => harness.lifecycle.dispose());
+
+    await expect(
+      harness.behavior.callRpc("evaluateAutoSettle", {}),
+    ).resolves.toEqual({ changedThreadIds: ["thr_quiet"] });
+    expect(harness.inspection.sdk.callsTo("projects.list")).toEqual([
+      [{ include: "threads", includePersonal: true }],
+    ]);
+    expect(harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+      [{ threadId: "thr_quiet" }],
+    ]);
+  });
+
+  it("never settles a thread still serving a port, or one whose host cannot be scanned", async () => {
+    const old = Date.now() - 4 * 24 * 60 * 60 * 1_000;
+    const inWorkspace = (id: string, environmentId: string, hostId = "host_1") => projectThread({
+      id, createdAt: old, updatedAt: old, latestAttentionAt: old,
+      environmentId, environmentPath: `/workspace/${environmentId}`, environmentHostId: hostId,
+    });
+    const scans: Array<{ hostId: string; input: unknown }> = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "bb-sidebar",
+      experimental_callHostRpc: async ({ method, hostId, input }) => {
+        expect(method).toBe("scan");
+        scans.push({ hostId, input });
+        if (hostId === "host_offline") throw new Error("Host is not connected");
+        return {
+          ports: [
+            { environmentId: "env_owned", port: 3000, pid: 11, source: "process", ownerThreadId: "thr_owned" },
+            { environmentId: "env_solo", port: 4000, pid: 12, source: "process" },
+            { environmentId: "env_shared", port: 5000, pid: 13, source: "process" },
+            { environmentId: "env_docker", port: 6000, source: "docker" },
+          ],
+        };
+      },
+      sdk: {
+        projects: {
+          list: async () =>
+            projectsWith([
+              inWorkspace("thr_owned", "env_owned"),
+              inWorkspace("thr_solo", "env_solo"),
+              inWorkspace("thr_shared_a", "env_shared"),
+              inWorkspace("thr_shared_b", "env_shared"),
+              inWorkspace("thr_docker", "env_docker"),
+              inWorkspace("thr_offline", "env_offline", "host_offline"),
+              projectThread({ id: "thr_gone", createdAt: old, updatedAt: old, latestAttentionAt: old, environmentId: "env_gone" }),
+            ]),
+        },
+        environments: {
+          pullRequest: async () => ({ outcome: "absent" as const }),
+        },
+      },
+    });
+    await plugin(bb);
+    disposers.push(() => harness.lifecycle.dispose());
+
+    await expect(
+      harness.behavior.callRpc("evaluateAutoSettle", {}),
+    ).resolves.toEqual({
+      changedThreadIds: ["thr_shared_a", "thr_shared_b", "thr_docker", "thr_gone"],
+    });
+    expect(scans.map((scan) => scan.hostId).sort()).toEqual(["host_1", "host_offline"]);
+    expect(
+      (harness.inspection.sdk.callsTo("threads.stop") as Array<[{ threadId: string }]>)
+        .map(([{ threadId }]) => threadId)
+        .sort(),
+    ).toEqual(["thr_docker", "thr_gone", "thr_shared_a", "thr_shared_b"]);
+  });
+
   it("keeps manual un-settle active until real work clears the override", async () => {
     const old = Date.now() - 4 * 24 * 60 * 60 * 1_000;
-    const thread = makeThreadResponse({
+    const fields = {
       id: "thr_override",
       createdAt: old,
       updatedAt: old,
       latestAttentionAt: old,
-      status: "idle",
-    });
+      status: "idle" as const,
+    };
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: {
-          list: async () => [thread],
+        projects: {
+          list: async () => projectsWith([projectThread(fields)]),
         },
       },
     });
@@ -1088,7 +1251,9 @@ describe("automatic settle evaluation", () => {
       harness.behavior.callRpc("evaluateAutoSettle", {}),
     ).resolves.toEqual({ changedThreadIds: [] });
 
-    await harness.behavior.emitThreadEvent("thread.active", { thread });
+    await harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse(fields),
+    });
     await expect(
       harness.behavior.callRpc("listLifecycle", {}),
     ).resolves.toEqual({ rows: [] });
@@ -1100,9 +1265,10 @@ describe("automatic settle evaluation", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: {
-          list: async () => [
-            makeThreadResponse({
+        projects: {
+          list: async () =>
+            projectsWith([
+            projectThread({
               id: "thr_a",
               environmentId,
               createdAt: old,
@@ -1110,7 +1276,7 @@ describe("automatic settle evaluation", () => {
               latestAttentionAt: old,
               status: "idle",
             }),
-            makeThreadResponse({
+            projectThread({
               id: "thr_b",
               environmentId,
               createdAt: old,
@@ -1118,7 +1284,7 @@ describe("automatic settle evaluation", () => {
               latestAttentionAt: old,
               status: "idle",
             }),
-            makeThreadResponse({
+            projectThread({
               id: "thr_running",
               environmentId: "env_running",
               createdAt: old,
@@ -1126,7 +1292,7 @@ describe("automatic settle evaluation", () => {
               latestAttentionAt: old,
               status: "active",
             }),
-            makeThreadResponse({
+            projectThread({
               id: "thr_pinned",
               environmentId: "env_pinned",
               createdAt: old,
@@ -1135,7 +1301,7 @@ describe("automatic settle evaluation", () => {
               pinnedAt: Date.now(),
               status: "idle",
             }),
-          ],
+            ]),
         },
         environments: {
           pullRequest: async () => availablePullRequest("merged"),
@@ -1156,7 +1322,7 @@ describe("automatic settle evaluation", () => {
   it("queues one policy pass when settings change during evaluation", async () => {
     const old = Date.now() - 60_000;
     const environmentId = "env_queued";
-    const thread = makeThreadResponse({
+    const thread = projectThread({
       id: "thr_queued",
       environmentId,
       createdAt: old,
@@ -1174,7 +1340,7 @@ describe("automatic settle evaluation", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: { list: async () => [thread] },
+        projects: { list: async () => projectsWith([thread]) },
         environments: {
           pullRequest: async () => {
             pullRequestCalls += 1;
@@ -1237,9 +1403,10 @@ describe("automatic settle evaluation", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: {
-          list: async () => [
-            makeThreadResponse({
+        projects: {
+          list: async () =>
+            projectsWith([
+            projectThread({
               id: "thr_pr",
               environmentId: "env_pr",
               createdAt: recent,
@@ -1247,7 +1414,7 @@ describe("automatic settle evaluation", () => {
               latestAttentionAt: recent,
               status: "idle",
             }),
-          ],
+            ]),
         },
         environments: {
           pullRequest: async () => availablePullRequest(pullRequestState),
@@ -1275,9 +1442,10 @@ describe("automatic settle evaluation", () => {
     const { bb, harness } = createFakePluginHost({
       pluginId: "bb-sidebar",
       sdk: {
-        threads: {
-          list: async () => [
-            makeThreadResponse({
+        projects: {
+          list: async () =>
+            projectsWith([
+            projectThread({
               id: "thr_pin",
               createdAt: old,
               updatedAt: old,
@@ -1285,7 +1453,7 @@ describe("automatic settle evaluation", () => {
               pinnedAt,
               status: "idle",
             }),
-          ],
+            ]),
         },
       },
     });

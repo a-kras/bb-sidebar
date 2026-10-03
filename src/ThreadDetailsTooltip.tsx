@@ -16,6 +16,7 @@ import { StatusGlyph } from "./StatusGlyph";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { PROJECT_ICONS_CHANNEL, projectIconUrl } from "./project-icons";
 import { OpenPortDetails } from "./OpenPorts";
+import { ThreadPullRequestDetails } from "./ThreadPullRequests";
 import { compareChildThreads, useChildThreadDisplay } from "./ChildThreadDisplay";
 
 export function ThreadDetailsTooltip({
@@ -79,7 +80,7 @@ export function ThreadDetailsTooltip({
           <div className="flex items-center gap-2">
             <ProjectFavicon
               src={projectIconUrl(project.id, iconRevision)}
-              fallback={<Icon name="FolderGit" className="size-3.5 shrink-0" aria-hidden />}
+              name={project.name}
             />
             <span className="truncate"><span className="sr-only">Project: </span>{project.name}</span>
           </div>
@@ -157,6 +158,7 @@ export function ThreadDetailsTooltip({
             </ul> : null}
           </div>
         ) : null}
+        <ThreadPullRequestDetails thread={thread} />
         <OpenPortDetails thread={thread} />
       </div>
     </div>
