@@ -5,6 +5,7 @@
 // HOST_DAEMON_PROTOCOL_VERSION bump for something only this sidebar
 // understands. Here, uninstalling the plugin removes its state with it.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   autoSettleNeedsPullRequest,
@@ -36,7 +37,7 @@ import {
   SIDEBAR_SETTINGS_CHANNEL,
   type SidebarSettingsValues,
 } from "./sidebar-settings";
-import { configuredSnoozePresetError } from "./lifecycle";
+import { canPark, configuredSnoozePresetError, hasLiveWork, isTurnInFlight } from "./lifecycle";
 import { portSnapshotSchema } from "./open-ports";
 import { createPortDiscovery } from "./port-discovery";
 import { createThreadPortActions } from "./thread-ports";
@@ -92,6 +93,12 @@ const migrations = [
      ADD COLUMN child_sort_direction TEXT NOT NULL DEFAULT 'ascending'`,
   `ALTER TABLE sidebar_settings
      ADD COLUMN child_icon_style TEXT NOT NULL DEFAULT 'disc'`,
+  `ALTER TABLE sidebar_settings
+     ADD COLUMN compact_working_threads INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE sidebar_settings
+     ADD COLUMN working_shelf INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE sidebar_settings
+     ADD COLUMN dock_shelves INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export interface StoredLifecycleRow {
@@ -123,6 +130,9 @@ interface SidebarSettingsDbRow {
   child_sort_field: string;
   child_sort_direction: string;
   child_icon_style: string;
+  compact_working_threads: number;
+  working_shelf: number;
+  dock_shelves: number;
 }
 
 const threadIdSchema = z.object({ threadId: z.string().trim().min(1) });
@@ -149,6 +159,30 @@ const orderedThreadIdsSchema = z
     }
   });
 const threadIdsSchema = orderedThreadIdsSchema.min(1);
+const cleanupIssueSchema = z.object({
+  threadId: z.string(),
+  resource: z.enum(["thread", "terminal", "port"]),
+  message: z.string(),
+});
+const cleanupPreviewSchema = z.object({
+  token: z.string(),
+  threads: z.array(z.object({
+    threadId: z.string(),
+    title: z.string(),
+    terminalCount: z.number().int().nonnegative(),
+    ports: z.array(z.number().int()),
+  })),
+  skipped: z.array(cleanupIssueSchema),
+});
+const cleanupResultSchema = z.object({
+  closedTerminals: z.number().int().nonnegative(),
+  signalledPorts: z.array(z.object({ threadId: z.string(), port: z.number().int() })),
+  remainingPorts: z.array(z.object({ threadId: z.string(), port: z.number().int() })),
+  skipped: z.array(cleanupIssueSchema),
+  failed: z.array(cleanupIssueSchema),
+});
+export type SettledCleanupPreview = z.infer<typeof cleanupPreviewSchema>;
+export type SettledCleanupResult = z.infer<typeof cleanupResultSchema>;
 const projectIdSchema = z.string().trim().min(1);
 const projectIconPathSchema = z
   .string()
@@ -177,6 +211,9 @@ const sidebarSettingsSchema = z
     childSortField: z.enum(CHILD_THREAD_SORT_FIELDS),
     childSortDirection: z.enum(CHILD_THREAD_SORT_DIRECTIONS),
     childIconStyle: z.enum(CHILD_THREAD_ICON_STYLES),
+    compactWorkingThreads: z.boolean(),
+    workingShelf: z.boolean(),
+    dockShelves: z.boolean(),
   })
   .strict();
 const uploadFilenameSchema = z
@@ -204,6 +241,14 @@ export const bbSidebarRpcContract = defineRpcContract({
   closeThreadPorts: {
     input: threadIdSchema.extend({ ports: z.array(ownedPortTargetSchema).min(1).max(1000) }),
     output: closePortsResultSchema,
+  },
+  previewSettledCleanup: {
+    input: z.object({ threadIds: threadIdsSchema }).strict(),
+    output: cleanupPreviewSchema,
+  },
+  cleanSettled: {
+    input: z.object({ token: z.string().uuid() }).strict(),
+    output: cleanupResultSchema,
   },
   stopWorkspacePort: {
     input: threadIdSchema.extend({ port: ownedPortTargetSchema }).strict(),
@@ -241,7 +286,12 @@ export const bbSidebarRpcContract = defineRpcContract({
     output: sidebarSettingsSchema,
   },
   updateSidebarSettings: {
-    input: sidebarSettingsSchema,
+    // A client built before a setting existed leaves it out; keep what is stored.
+    input: sidebarSettingsSchema.partial({
+      compactWorkingThreads: true,
+      workingShelf: true,
+      dockShelves: true,
+    }),
     output: sidebarSettingsSchema,
   },
   listLifecycle: {
@@ -490,7 +540,8 @@ export default async function plugin(bb: BbPluginApi) {
                 inactive_after_hours, show_running_children_when_collapsed,
                 auto_settle_inactive,
                 auto_settle_after_days, auto_settle_on_merge,
-                child_sort_field, child_sort_direction, child_icon_style
+                child_sort_field, child_sort_direction, child_icon_style,
+                compact_working_threads, working_shelf, dock_shelves
            FROM sidebar_settings
           WHERE id = 1`,
       )
@@ -510,6 +561,9 @@ export default async function plugin(bb: BbPluginApi) {
             childSortDirection: row.child_sort_direction,
             childIconStyle: row.child_icon_style,
           }),
+          compactWorkingThreads: row.compact_working_threads === 1,
+          workingShelf: row.working_shelf === 1,
+          dockShelves: row.dock_shelves === 1,
         }
       : { ...DEFAULT_SIDEBAR_SETTINGS };
   };
@@ -520,8 +574,9 @@ export default async function plugin(bb: BbPluginApi) {
          inactive_after_hours, show_running_children_when_collapsed,
          auto_settle_inactive,
          auto_settle_after_days, auto_settle_on_merge,
-         child_sort_field, child_sort_direction, child_icon_style
-       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         child_sort_field, child_sort_direction, child_icon_style,
+         compact_working_threads, working_shelf, dock_shelves
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          snooze_presets = excluded.snooze_presets,
          inactive_threads_enabled = excluded.inactive_threads_enabled,
@@ -533,7 +588,10 @@ export default async function plugin(bb: BbPluginApi) {
          auto_settle_on_merge = excluded.auto_settle_on_merge,
          child_sort_field = excluded.child_sort_field,
          child_sort_direction = excluded.child_sort_direction,
-         child_icon_style = excluded.child_icon_style`,
+         child_icon_style = excluded.child_icon_style,
+         compact_working_threads = excluded.compact_working_threads,
+         working_shelf = excluded.working_shelf,
+         dock_shelves = excluded.dock_shelves`,
     ).run(
       values.snoozePresets,
       values.inactiveThreadsEnabled ? 1 : 0,
@@ -545,6 +603,9 @@ export default async function plugin(bb: BbPluginApi) {
       values.childSortField,
       values.childSortDirection,
       values.childIconStyle,
+      values.compactWorkingThreads ? 1 : 0,
+      values.workingShelf ? 1 : 0,
+      values.dockShelves ? 1 : 0,
     );
   };
 
@@ -598,6 +659,9 @@ export default async function plugin(bb: BbPluginApi) {
         childSortField: DEFAULT_SIDEBAR_SETTINGS.childSortField,
         childSortDirection: DEFAULT_SIDEBAR_SETTINGS.childSortDirection,
         childIconStyle: DEFAULT_SIDEBAR_SETTINGS.childIconStyle,
+        compactWorkingThreads: DEFAULT_SIDEBAR_SETTINGS.compactWorkingThreads,
+        workingShelf: DEFAULT_SIDEBAR_SETTINGS.workingShelf,
+        dockShelves: DEFAULT_SIDEBAR_SETTINGS.dockShelves,
       });
       if (hasLegacyValues && migrated.success) {
         writeSidebarSettings(migrated.data);
@@ -968,7 +1032,7 @@ export default async function plugin(bb: BbPluginApi) {
   // work the sidebar checks (workflows, background commands, plan mode, goals,
   // a pending interaction, queued messages). One unpaged request covers the
   // same unarchived, visible threads the old paged thread list did.
-  const loadPolicyThreads = async () => {
+  const loadPolicyThreads = async (includeHidden = false) => {
     const projects = await bb.sdk.projects.list({
       include: "threads",
       includePersonal: true,
@@ -979,11 +1043,98 @@ export default async function plugin(bb: BbPluginApi) {
             (thread) =>
               thread.archivedAt === null &&
               thread.deletedAt === null &&
-              thread.visibility === "visible",
+              (includeHidden || thread.visibility === "visible"),
           )
         : [],
     );
   };
+
+  type CleanupThread = Awaited<ReturnType<typeof loadPolicyThreads>>[number];
+  type CleanupIssue = z.infer<typeof cleanupIssueSchema>;
+  type CleanupPlanThread = {
+    threadId: string;
+    terminalIds: string[];
+    ports: Array<z.infer<typeof ownedPortTargetSchema>>;
+    workspace: { environmentId: string; hostId: string; path: string } | null;
+  };
+  const sameCleanupWorkspace = (
+    left: CleanupPlanThread["workspace"],
+    right: CleanupPlanThread["workspace"],
+  ) => left === null ? right === null : right !== null &&
+    left.environmentId === right.environmentId && left.hostId === right.hostId && left.path === right.path;
+  const terminalInCleanupWorkspace = (
+    session: { environmentId: string | null; hostId: string | null },
+    workspace: CleanupPlanThread["workspace"],
+  ) => workspace === null ? session.environmentId === null :
+    session.environmentId === workspace.environmentId && session.hostId === workspace.hostId;
+  const cleanupPlans = new Map<string, { expiresAt: number; threads: CleanupPlanThread[]; skipped: CleanupIssue[] }>();
+  bb.onDispose(() => cleanupPlans.clear());
+
+  const canCleanSettledThread = (thread: CleanupThread, row: StoredLifecycleRow | null) => {
+    if (!row || thread.visibility !== "visible" || row.settledAt === null || row.parkedAt != null ||
+        row.snoozedUntil !== null || thread.pinnedAt !== null ||
+        thread.latestAttentionAt > row.settledAt) return false;
+    const activity = thread.activity;
+    return canPark({
+      hasPendingInteraction: thread.hasPendingInteraction,
+      hasQueuedWork: thread.queuedWork !== "none",
+      isWorking: hasLiveWork({
+        workflows: activity.activeWorkflowCount,
+        backgroundAgents: activity.activeBackgroundAgentCount,
+        backgroundCommands: activity.activeBackgroundCommandCount,
+        planMode: activity.activePlanModeCount,
+        goals: activity.activeGoalCount,
+      }, isTurnInFlight(thread.status)),
+    });
+  };
+  const cleanupContext = async (targetThreadId?: string) => {
+    const beforeLookup = await loadPolicyThreads(true);
+    const target = targetThreadId ? beforeLookup.find((thread) => thread.id === targetThreadId) : undefined;
+    const lookupThreads = target ? beforeLookup.filter((thread) =>
+      thread.environmentId === target.environmentId ||
+      (target.environmentHostId && thread.environmentHostId === target.environmentHostId),
+    ) : beforeLookup;
+    const { paths, failedHosts } = await threadPortActions.canonicalWorkspacePaths(lookupThreads);
+    // Host path lookup can take seconds. Policy and activity must be read
+    // again after it, before any cleanup decision is made.
+    const threads = await loadPolicyThreads(true);
+    const byId = new Map(threads.map((thread) => [thread.id, thread] as const));
+    const currentTarget = targetThreadId ? byId.get(targetThreadId) : undefined;
+    const relevant = currentTarget ? threads.filter((thread) =>
+      thread.environmentId === currentTarget.environmentId ||
+      (currentTarget.environmentHostId && thread.environmentHostId === currentTarget.environmentHostId),
+    ) : threads;
+    const workspaceKeys = (thread: CleanupThread): string[] => {
+      if (!thread.environmentId) return [];
+      const path = paths.get(thread.environmentId);
+      return [
+        `environment:${thread.environmentId}`,
+        ...(thread.environmentHostId && path ? [`path:${thread.environmentHostId}\0${path}`] : []),
+      ];
+    };
+    const protectedWorkspaces = new Set(relevant.flatMap((thread) => {
+      if (canCleanSettledThread(thread, readOne(thread.id))) return [];
+      return workspaceKeys(thread);
+    }));
+    const unresolvedProtectedHosts = new Set(relevant.flatMap((thread) => {
+      if (canCleanSettledThread(thread, readOne(thread.id))) return [];
+      if (!thread.environmentHostId || !thread.environmentPath ||
+          !thread.environmentId || !paths.has(thread.environmentId)) {
+        return thread.environmentHostId ? [thread.environmentHostId] : [];
+      }
+      return [];
+    }));
+    const isProtectedWorkspace = (thread: CleanupThread) => {
+      if (!thread.environmentId) return false;
+      if (!thread.environmentHostId || !thread.environmentPath ||
+          failedHosts.has(thread.environmentHostId) || !paths.has(thread.environmentId) ||
+          unresolvedProtectedHosts.has(thread.environmentHostId)) return true;
+      return workspaceKeys(thread).some((key) => protectedWorkspaces.has(key));
+    };
+    return { byId, isProtectedWorkspace };
+  };
+  const cleanupError = (error: unknown): string =>
+    error instanceof Error && error.message.trim() ? error.message : String(error);
 
   const loadPullRequests = async (environmentIds: readonly string[]) => {
     const results = new Map<string, AutoSettlePullRequest>();
@@ -1217,6 +1368,158 @@ export default async function plugin(bb: BbPluginApi) {
     getOpenPorts,
     getThreadPorts: threadPortActions.getThreadPorts,
     getThreadPullRequests: threadPullRequests.getThreadPullRequests,
+    async previewSettledCleanup({ threadIds }) {
+      const { byId, isProtectedWorkspace } = await cleanupContext();
+      const threads: z.infer<typeof cleanupPreviewSchema>["threads"] = [];
+      const skipped: CleanupIssue[] = [];
+      const planned: CleanupPlanThread[] = [];
+      const work = await runThreadTasks(threadIds, async (threadId) => {
+        const thread = byId.get(threadId);
+        if (!thread || !canCleanSettledThread(thread, readOne(threadId))) {
+          skipped.push({ threadId, resource: "thread", message: "Thread is no longer in Settled or has active work" });
+          return;
+        }
+        if (isProtectedWorkspace(thread)) return;
+        let workspace: CleanupPlanThread["workspace"];
+        try {
+          workspace = await threadPortActions.getThreadWorkspace({ threadId });
+        } catch (error) {
+          skipped.push({ threadId, resource: "thread", message: `Could not verify workspace: ${cleanupError(error)}` });
+          return;
+        }
+        const terminalIds: string[] = [];
+        try {
+          const { sessions } = await bb.sdk.terminals.list({ scope: { kind: "thread", threadId } });
+          terminalIds.push(...sessions.filter((session) =>
+            session.threadId === threadId &&
+            terminalInCleanupWorkspace(session, workspace) &&
+            (session.status === "running" || session.status === "starting"),
+          ).map((session) => session.id));
+        } catch (error) {
+          skipped.push({ threadId, resource: "terminal", message: `Could not inspect terminals: ${cleanupError(error)}` });
+        }
+        let ports: CleanupPlanThread["ports"] = [];
+        if (thread.environmentId) {
+          try {
+            const found = await threadPortActions.getThreadPorts({ threadId });
+            ports = found.ports.filter((port) => port.processStartedAt);
+            if (!sameCleanupWorkspace(workspace, found.workspace)) {
+              skipped.push({ threadId, resource: "port", message: "Thread workspace changed during preview" });
+              ports = [];
+            }
+          } catch (error) {
+            skipped.push({ threadId, resource: "port", message: `Could not inspect ports: ${cleanupError(error)}` });
+          }
+        }
+        if (terminalIds.length > 0 || ports.length > 0) {
+          planned.push({ threadId, terminalIds, ports, workspace });
+          threads.push({
+            threadId,
+            title: thread.title ?? thread.titleFallback ?? threadId,
+            terminalCount: terminalIds.length,
+            ports: [...new Set(ports.map((port) => port.port))],
+          });
+        }
+      }, 4);
+      skipped.push(...work.failures.map(({ threadId, error }) => ({ threadId, resource: "thread" as const, message: error })));
+      const token = randomUUID();
+      const now = Date.now();
+      for (const [oldToken, plan] of cleanupPlans) if (plan.expiresAt <= now) cleanupPlans.delete(oldToken);
+      cleanupPlans.set(token, { expiresAt: now + 2 * 60_000, threads: planned, skipped });
+      const order = new Map(threadIds.map((id, index) => [id, index]));
+      threads.sort((a, b) => order.get(a.threadId)! - order.get(b.threadId)!);
+      return { token, threads, skipped };
+    },
+    async cleanSettled({ token }) {
+      const plan = cleanupPlans.get(token);
+      cleanupPlans.delete(token);
+      if (!plan || plan.expiresAt <= Date.now()) throw new Error("Cleanup preview expired. Review the resources again.");
+      const result: z.infer<typeof cleanupResultSchema> = {
+        closedTerminals: 0,
+        signalledPorts: [],
+        remainingPorts: [],
+        skipped: [...plan.skipped],
+        failed: [],
+      };
+      const plannedById = new Map(plan.threads.map((thread) => [thread.threadId, thread]));
+      const work = await runThreadTasks(plan.threads.map((thread) => thread.threadId), async (threadId) => {
+        const { byId, isProtectedWorkspace } = await cleanupContext(threadId);
+        const thread = byId.get(threadId);
+        if (!thread || !canCleanSettledThread(thread, readOne(threadId)) || isProtectedWorkspace(thread)) {
+          result.skipped.push({ threadId, resource: "thread", message: "Thread returned to Active or Working, or shares a protected workspace" });
+          return;
+        }
+        const plannedThread = plannedById.get(threadId)!;
+        if (plannedThread.terminalIds.length > 0) {
+          try {
+            const { sessions } = await bb.sdk.terminals.list({ scope: { kind: "thread", threadId } });
+            const current = new Map(sessions.map((session) => [session.id, session]));
+            for (const terminalId of plannedThread.terminalIds) {
+              const latestWorkspace = await threadPortActions.getThreadWorkspace({ threadId });
+              const latest = await cleanupContext(threadId);
+              const latestThread = latest.byId.get(threadId);
+              if (!latestThread || !canCleanSettledThread(latestThread, readOne(threadId)) ||
+                  latest.isProtectedWorkspace(latestThread) ||
+                  !sameCleanupWorkspace(plannedThread.workspace, latestWorkspace)) {
+                result.skipped.push({ threadId, resource: "terminal", message: `Terminal ${terminalId} is now protected by active work or a shared workspace` });
+                break;
+              }
+              const session = current.get(terminalId);
+              if (!session || session.threadId !== threadId ||
+                  !terminalInCleanupWorkspace(session, latestWorkspace) ||
+                  (session.status !== "running" && session.status !== "starting")) {
+                result.skipped.push({ threadId, resource: "terminal", message: `Terminal ${terminalId} is no longer owned by this settled thread` });
+                continue;
+              }
+              try {
+                await bb.sdk.terminals.close({ terminalId, mode: "force" });
+                result.closedTerminals += 1;
+              } catch (error) {
+                result.failed.push({ threadId, resource: "terminal", message: `Terminal ${terminalId}: ${cleanupError(error)}` });
+              }
+            }
+          } catch (error) {
+            result.failed.push({ threadId, resource: "terminal", message: `Could not recheck terminals: ${cleanupError(error)}` });
+          }
+        }
+        if (plannedThread.ports.length === 0) return;
+        try {
+          const current = await threadPortActions.getThreadPorts({ threadId });
+          if (!plannedThread.workspace || !sameCleanupWorkspace(plannedThread.workspace, current.workspace)) {
+            result.skipped.push({ threadId, resource: "port", message: "Thread workspace changed since preview" });
+            return;
+          }
+          const targets = plannedThread.ports.filter((target) => current.ports.some((port) =>
+            port.pid === target.pid && port.port === target.port && port.processStartedAt === target.processStartedAt,
+          ));
+          if (targets.length < plannedThread.ports.length) {
+            result.skipped.push({ threadId, resource: "port", message: "Some previewed ports changed ownership or closed" });
+          }
+          if (targets.length === 0) return;
+          const beforeSignal = await cleanupContext(threadId);
+          const signalThread = beforeSignal.byId.get(threadId);
+          if (!signalThread || !canCleanSettledThread(signalThread, readOne(threadId)) ||
+              beforeSignal.isProtectedWorkspace(signalThread)) {
+            result.skipped.push({ threadId, resource: "port", message: "Thread or shared workspace became active before shutdown" });
+            return;
+          }
+          const closed = await threadPortActions.closeThreadPorts({ threadId, ports: targets, expectedWorkspace: plannedThread.workspace });
+          result.signalledPorts.push(...closed.signalled.map((port) => ({ threadId, port })));
+          result.skipped.push(...closed.skipped.map((port) => ({ threadId, resource: "port" as const, message: `Port :${port} changed before shutdown` })));
+          result.failed.push(...closed.failed.map((port) => ({ threadId, resource: "port" as const, message: `Could not signal port :${port}` })));
+          if (closed.signalled.length > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 750));
+            const after = await threadPortActions.getThreadPorts({ threadId });
+            result.remainingPorts.push(...after.ports.filter((port) => closed.signalled.includes(port.port)).map((port) => ({ threadId, port: port.port })));
+          }
+        } catch (error) {
+          result.failed.push({ threadId, resource: "port", message: cleanupError(error) });
+        }
+      }, 4);
+      result.failed.push(...work.failures.map(({ threadId, error }) => ({ threadId, resource: "thread" as const, message: error })));
+      getOpenPorts.invalidate();
+      return result;
+    },
     async closeThreadPorts(input) {
       if (readOne(input.threadId)?.settledOverride !== "settled") {
         throw new Error("Thread is no longer settled");
@@ -1257,7 +1560,14 @@ export default async function plugin(bb: BbPluginApi) {
       return readSidebarSettings();
     },
     async updateSidebarSettings(values) {
-      writeSidebarSettings(values);
+      const stored = readSidebarSettings();
+      writeSidebarSettings({
+        ...values,
+        compactWorkingThreads:
+          values.compactWorkingThreads ?? stored.compactWorkingThreads,
+        workingShelf: values.workingShelf ?? stored.workingShelf,
+        dockShelves: values.dockShelves ?? stored.dockShelves,
+      });
       bb.realtime.publish(SIDEBAR_SETTINGS_CHANNEL, {});
       void evaluatePolicies().catch((error) => {
         bb.log.error(

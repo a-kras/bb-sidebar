@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## [0.2.29] - 2026-10-03
+
+### Added
+
+- **Clean** in the Settled header previews only live terminals and verified thread-owned listening ports before asking for confirmation. Threads with nothing to clean and zero counts stay out of the preview. Each listed thread has an Open button for inspection. Clean force-closes the listed terminals and sends graceful shutdown requests to listed port processes. Threads that return to Active or Working are skipped, as are resources in a workspace shared with another non-settled thread. The result lists completed, skipped, failed, and still-listening resources.
+- **Dock shelves to the bottom (experimental)**, off by default in sidebar settings. Every shelf after Active (Working, Inactive, Snoozed, Parked, Settled) rests at the bottom of the sidebar, below the space Pinned and Active leave free, as in T3 Code. An open shelf that needs more room extends the list, and everything scrolls together.
+- **Working shelf (experimental)**, off by default in sidebar settings. A thread that is working, or has work running under it (child threads, background agents, commands, workflows, goals), moves out of Active into a Working shelf right below it, shown as one line like the other shelves, whether or not **Compact working threads** is on. It returns to its place in Active when all of it is done, or as soon as it fails or needs you. Pinned threads stay pinned, and a thread that just woke from a snooze stays in Active.
+
+### Changed
+
+- The Working shelf's header spinner now turns while the shelf contains live work, and stays still when reduced motion is enabled.
+- The thread list scrolls like T3 Code's sidebar: no scrollbar, and an edge fades out only where there is more to scroll, growing with the distance left. Scrolling the list no longer scrolls what is behind it.
+- A compact working row stays compact until everything under it is done: its own turn, its background agents, commands and workflows, and any working child or grandchild. It used to unfold into a full card as soon as the parent's own turn ended. It still unfolds at once if the parent needs you or fails. While only its children run, the row shows its usual status or age, and the badge shows the children still working.
+- A compact working row keeps its child threads folded, including children that need attention, until you expand them from its badge. Full cards still show those children while folded when **Show children that need attention** is on.
+
+### Fixed
+
+- Clean rechecks a thread before each terminal close and skips terminals in workspaces shared with Active or Working threads. It checks each terminal's own environment and host, even when the thread has moved. Workspace paths are resolved on the host before comparing them, including symlink aliases; unresolved paths block cleanup.
+- Clean binds previewed ports to their workspace and process start time, preserves partial shutdown results, and retains preview inspection failures in its final report. Open stays disabled during cleanup and closes the mobile sidebar drawer when used.
+- Live descendants remain classified as working even when their unread-success badge takes precedence. A thread requesting input stays in Active, compact Unpin controls remain clickable, and a rename in progress stays mounted while work finishes. If an attention, pin, or dock change interrupts a rename, its draft saves once and its shelf lock clears. Keyboard focus follows the thread or child control between shelves.
+- Clean's result remains visible if its last Settled thread leaves the shelf while cleanup is running.
+- Scroll-edge fades update when loading or search replaces the list contents.
+
+## [0.2.28] - 2026-10-03
+
+### Added
+
+- **Compact working threads (experimental)**, off by default in sidebar settings. A thread with live work shows as one line, like a settled thread, ending in a small status icon and how long it has run (◌ 6m). It returns to a full card when it finishes, fails, or needs you. Folded rows still reorder, open their child threads, and keep the right-click menu.
+- Snooze offers **Pick date & time…** below its shortcuts, in both the row's clock menu and the right-click menu. It opens a calendar and a time field, starting at tomorrow 9:00, and shows the exact wake time before you confirm. Past times and dates more than a year out cannot be picked.
+
+### Changed
+
+- The settings page is reorganised to match bb's own: Shelves, Snooze, Automatic settle, Child threads, Projects, This device, and Experimental. Changes save as you make them, so there is no Save button: the section you changed shows **Saving…** and then **Saved**, or **Not saved** if the save failed. An invalid value shows why and is not saved. The hours and days for the inactive shelf and automatic settle appear only while their switch is on, the snooze shortcuts show the menu they produce, and one project picker serves both the project icon and removing a project.
+- The right-click menu lists thread actions as Pin, Snooze, Park thread, Settle.
+
 ## [0.2.27] - 2026-10-01
 
 ### Added

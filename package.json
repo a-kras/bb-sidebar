@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-bb-sidebar",
-  "version": "0.2.27",
+  "version": "0.2.29",
   "type": "module",
   "description": "A bb thread sidebar with manual and automatic sorting, snooze, and settle actions.",
   "license": "MIT",
@@ -80,6 +80,7 @@
     "hono": "^4.13.3",
     "jsdom": "^29.0.1",
     "react": "^19.0.0",
+    "react-day-picker": "^9.14.0",
     "react-dom": "^19.0.0",
     "sonner": "^1.7.4",
     "tailwind-merge": "^3.4.0",

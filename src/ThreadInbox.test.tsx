@@ -12,6 +12,7 @@ import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
 import { idleSidebarThreadFields } from "./test-fixtures";
 import { DEFAULT_SNOOZE_PRESET_CONFIG, formatSnoozeWakeTime } from "./lifecycle";
+import { isWorkingTree } from "./working-tree";
 import type { SidebarProvider } from "./ProviderGlyph";
 
 const toastMocks = vi.hoisted(() => ({
@@ -57,6 +58,9 @@ const defaultSidebarSettings = {
   childSortField: "created",
   childSortDirection: "ascending",
   childIconStyle: "disc",
+  compactWorkingThreads: false,
+  workingShelf: false,
+  dockShelves: false,
 };
 
 function thread(
@@ -485,12 +489,12 @@ describe("sidebar settings", () => {
       sidebarThreads: { status: "ready", projects: [], threads: [thread({ host: { id: "host_local", name: "Local Mac" } })] },
       rpc: { getSidebarSettings: () => defaultSidebarSettings, listProjectIconSettings: () => ({ projects: [] }) },
     });
-    const select = await screen.findByLabelText("Port links on this device");
+    const select = await screen.findByLabelText("Open port links on");
     expect(within(select).getByRole("option", { name: "Local Mac" })).toBeDefined();
     fireEvent.change(select, { target: { value: "host_local" } });
     expect(localStorage.getItem("bb-sidebar:port-link-host:v1")).toBe("host_local");
   });
-  it("groups related controls and saves them together", async () => {
+  it("groups related controls and saves changes without a save button", async () => {
     let saved: typeof defaultSidebarSettings | null = null;
     renderSlot(sidebarSettings, {}, {
       rpc: {
@@ -512,10 +516,12 @@ describe("sidebar settings", () => {
       },
     });
 
-    expect(await screen.findByText("Thread organization")).toBeDefined();
-    expect(screen.getByText("Child threads")).toBeDefined();
-    expect(screen.getByText("Automatic cleanup")).toBeDefined();
-    expect(screen.getByText("Project icons")).toBeDefined();
+    expect(
+      (await screen.findAllByRole("heading", { level: 2 })).map((heading) => heading.textContent),
+    ).toEqual([
+      "Shelves", "Snooze", "Automatic settle", "Child threads", "Projects", "This device", "Experimental",
+    ]);
+    expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
     expect(
       screen
         .getByRole("switch", { name: "Inactive shelf" })
@@ -542,7 +548,6 @@ describe("sidebar settings", () => {
     fireEvent.change(screen.getByLabelText("Child thread icon"), {
       target: { value: "provider" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
     await waitFor(() =>
       expect(saved).toEqual({
         ...defaultSidebarSettings,
@@ -552,19 +557,35 @@ describe("sidebar settings", () => {
         childSortDirection: "descending",
         childIconStyle: "provider",
       }),
+    );    // The section edited last says it saved; the others stay quiet.
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("region", { name: "Child threads" })).getByRole("status").textContent,
+      ).toBe("Saved"),
     );
+    expect(
+      within(screen.getByRole("region", { name: "Shelves" })).getByRole("status").textContent,
+    ).toBe("");
   });
 
-  it("blocks invalid settings and previews valid snooze shortcuts", async () => {
+  it("does not save invalid settings and previews valid snooze shortcuts", async () => {
+    const saves: unknown[] = [];
     renderSlot(sidebarSettings, {}, {
       rpc: {
         getSidebarSettings: () => defaultSidebarSettings,
+        updateSidebarSettings: (input) => {
+          saves.push(input);
+          return input as typeof defaultSidebarSettings;
+        },
         listProjectIconSettings: () => ({ projects: [] }),
       },
     });
+    const preview = () =>
+      within(screen.getByRole("list", { name: "Snooze menu preview" }))
+        .getAllByRole("listitem")
+        .map((item) => item.textContent);
 
     const snoozeInput = await screen.findByLabelText("Snooze shortcuts");
-    const saveButton = screen.getByRole("button", { name: "Save changes" });
     fireEvent.change(snoozeInput, { target: { value: "later" } });
     expect(snoozeInput.getAttribute("aria-invalid")).toBe("true");
     expect(
@@ -572,25 +593,34 @@ describe("sidebar settings", () => {
         "Use comma-separated durations or calendar times, such as 1h, Wait refresh=5h, evening@18:00, tomorrow@09:00, or next-week@09:00.",
       ),
     ).toBeDefined();
-    expect((saveButton as HTMLButtonElement).disabled).toBe(true);
 
     fireEvent.change(snoozeInput, {
       target: { value: "15m, Lunch=3h" },
     });
-    expect(screen.getByText("Menu: 15 minutes, Lunch")).toBeDefined();
-    expect((saveButton as HTMLButtonElement).disabled).toBe(false);
+    expect(preview()).toEqual(["15 minutes", "Lunch"]);
 
     fireEvent.change(snoozeInput, { target: { value: "tomorrow@25:00" } });
-    expect((saveButton as HTMLButtonElement).disabled).toBe(true);
+    expect(snoozeInput.getAttribute("aria-invalid")).toBe("true");
     fireEvent.change(snoozeInput, { target: { value: "Morning=tomorrow@08:30" } });
-    expect(screen.getByText("Menu: Morning")).toBeDefined();
-    expect((saveButton as HTMLButtonElement).disabled).toBe(false);
+    expect(preview()).toEqual(["Morning"]);
 
     const inactiveHours = screen.getByLabelText("Hours before inactive");
     fireEvent.change(inactiveHours, { target: { value: "0" } });
     expect(inactiveHours.getAttribute("aria-invalid")).toBe("true");
     expect(screen.getByText("Enter a whole number from 1 to 720.")).toBeDefined();
-    expect((saveButton as HTMLButtonElement).disabled).toBe(true);
+    // Past the save delay, nothing invalid has been sent.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(saves).toEqual([]);
+
+    // Turning the rule off hides the value it no longer uses.
+    fireEvent.click(screen.getByRole("switch", { name: "Inactive shelf" }));
+    expect(screen.queryByLabelText("Hours before inactive")).toBeNull();
+    await waitFor(() => expect(saves).toHaveLength(1));
+    expect(saves[0]).toMatchObject({
+      inactiveThreadsEnabled: false,
+      inactiveAfterHours: defaultSidebarSettings.inactiveAfterHours,
+      snoozePresets: "Morning=tomorrow@08:30",
+    });
   });
 
   it("uploads a project icon from the file picker", async () => {
@@ -639,7 +669,7 @@ describe("sidebar settings", () => {
         contentBase64: "PHN2Zy8+",
       }),
     );
-    expect(screen.getByText("brand.svg")).toBeDefined();
+    expect(screen.getByText("Uploaded: brand.svg")).toBeDefined();
   });
 
   it("keeps a settings cache written before the child-thread settings", () => {
@@ -690,7 +720,6 @@ describe("sidebar settings", () => {
     await rendered.emitRealtime("sidebar-settings", {});
 
     expect((shortcuts as HTMLInputElement).value).toBe("Local=45m");
-    expect(screen.getByText("Unsaved changes")).toBeDefined();
   });
 
   it("ignores an older project-icon load after a newer refresh", async () => {
@@ -760,7 +789,7 @@ describe("sidebar settings", () => {
     });
 
     expect(await screen.findByText("Projects")).toBeDefined();
-    fireEvent.click(await screen.findByRole("button", { name: "Remove..." }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove…" }));
     expect(screen.queryByRole("alertdialog")).toBeNull();
     const confirmation = screen.getByRole("group", {
       name: "Confirm removal of Sidebar",
@@ -778,7 +807,7 @@ describe("sidebar settings", () => {
         confirmation: "Sidebar",
       }),
     );
-    expect(await screen.findByText("No removable projects.")).toBeDefined();
+    expect(await screen.findByText("No projects yet.")).toBeDefined();
     expect(toastMocks.success).toHaveBeenCalledWith("Sidebar removed from BB");
   });
 });
@@ -4085,6 +4114,165 @@ describe("ThreadInbox", () => {
 });
 
 describe("parking threads", () => {
+  it("previews every Settled row and cleans only after confirmation", async () => {
+    const settledThreads = Array.from({ length: 11 }, (_, index) =>
+      thread({ id: `thr_${index}`, title: `Finished ${index}` }),
+    );
+    const previewSettledCleanup = vi.fn((input: unknown) => ({
+      token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55",
+      threads: (input as { threadIds: string[] }).threadIds.slice(0, 2).map((threadId, index) => ({
+        threadId, title: threadId, terminalCount: index === 0 ? 1 : 0, ports: index === 1 ? [3000] : [],
+      })),
+      skipped: [],
+    }));
+    const cleanSettled = vi.fn(() => ({
+      closedTerminals: 1,
+      signalledPorts: [{ threadId: "thr_1", port: 3000 }],
+      remainingPorts: [],
+      skipped: [],
+      failed: [],
+    }));
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: settledThreads,
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        listLifecycle: () => ({ rows: settledThreads.map((item) => ({
+          threadId: item.id, settledAt: 200, snoozedUntil: null, snoozedAt: null,
+        })) }),
+        previewSettledCleanup,
+        cleanSettled,
+      },
+    });
+    const shelf = await screen.findByRole("region", { name: "Settled" });
+    fireEvent.click(within(shelf).getByRole("button", { name: "Clean settled resources" }));
+    const dialog = await screen.findByRole("dialog", { name: "Clean settled resources?" });
+    await waitFor(() => expect(previewSettledCleanup).toHaveBeenCalledTimes(1));
+    expect(new Set((previewSettledCleanup.mock.calls[0]![0] as { threadIds: string[] }).threadIds)).toEqual(new Set(settledThreads.map((item) => item.id)));
+    expect(dialog.textContent).toContain("1 terminal to close · 1 listening port to stop");
+    expect(dialog.textContent).not.toContain("0 terminals");
+    expect(dialog.textContent).not.toContain("session");
+    expect(within(dialog).queryByText("thr_2")).toBeNull();
+    expect(cleanSettled).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Clean resources" }));
+    await waitFor(() => expect(cleanSettled).toHaveBeenCalledWith({ token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55" }));
+    expect(dialog.textContent).toContain("1 terminal closed · 1 port shutdown request sent");
+  });
+
+  it("shows an empty preview without a Clean confirmation button", async () => {
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [thread({ id: "thr_empty", title: "Finished" })],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        listLifecycle: () => ({ rows: [{ threadId: "thr_empty", settledAt: 200, snoozedUntil: null, snoozedAt: null }] }),
+        previewSettledCleanup: () => ({ token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55", threads: [], skipped: [] }),
+      },
+    });
+    const shelf = await screen.findByRole("region", { name: "Settled" });
+    fireEvent.click(within(shelf).getByRole("button", { name: "Clean settled resources" }));
+    const dialog = await screen.findByRole("dialog", { name: "Clean settled resources?" });
+    await waitFor(() => expect(dialog.textContent).toContain("No live terminals or thread-owned listening ports found."));
+    expect(within(dialog).queryByRole("button", { name: "Clean resources" })).toBeNull();
+  });
+
+  it("opens a thread from the Clean preview and closes the dialog", async () => {
+    const onNavigate = vi.fn();
+    const rendered = renderSlot(inbox, { ...listProps, onNavigate }, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [thread({ id: "thr_terminal", title: "Check this terminal" })],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        listLifecycle: () => ({ rows: [{ threadId: "thr_terminal", settledAt: 200, snoozedUntil: null, snoozedAt: null }] }),
+        previewSettledCleanup: () => ({
+          token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55",
+          threads: [{ threadId: "thr_terminal", title: "Check this terminal", terminalCount: 1, ports: [] }],
+          skipped: [],
+        }),
+      },
+    });
+    const shelf = await screen.findByRole("region", { name: "Settled" });
+    fireEvent.click(within(shelf).getByRole("button", { name: "Clean settled resources" }));
+    const dialog = await screen.findByRole("dialog", { name: "Clean settled resources?" });
+    fireEvent.click(await within(dialog).findByRole("button", { name: "Open thread: Check this terminal" }));
+    expect(rendered.sidebarActionCalls).toContainEqual({ method: "open", threadId: "thr_terminal" });
+    expect(onNavigate).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Clean settled resources?" })).toBeNull());
+  });
+
+  it("keeps the Clean preview open while cleanup is running", async () => {
+    const pending = deferred<{ closedTerminals: number; signalledPorts: never[]; remainingPorts: never[]; skipped: never[]; failed: never[] }>();
+    const rendered = renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [thread({ id: "thr_terminal", title: "Check this terminal" })],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        listLifecycle: () => ({ rows: [{ threadId: "thr_terminal", settledAt: 200, snoozedUntil: null, snoozedAt: null }] }),
+        previewSettledCleanup: () => ({
+          token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55",
+          threads: [{ threadId: "thr_terminal", title: "Check this terminal", terminalCount: 1, ports: [] }],
+          skipped: [],
+        }),
+        cleanSettled: () => pending.promise,
+      },
+    });
+    const shelf = await screen.findByRole("region", { name: "Settled" });
+    fireEvent.click(within(shelf).getByRole("button", { name: "Clean settled resources" }));
+    const dialog = await screen.findByRole("dialog", { name: "Clean settled resources?" });
+    const cleanButton = await within(dialog).findByRole("button", { name: "Clean resources" });
+    fireEvent.click(cleanButton);
+    const openButton = within(dialog).getByRole("button", { name: "Open thread: Check this terminal" });
+    expect(openButton).toHaveProperty("disabled", true);
+    fireEvent.click(openButton);
+    expect(rendered.sidebarActionCalls).not.toContainEqual({ method: "open", threadId: "thr_terminal" });
+    expect(screen.getByRole("dialog", { name: "Clean settled resources?" })).toBeDefined();
+    pending.resolve({ closedTerminals: 1, signalledPorts: [], remainingPorts: [], skipped: [], failed: [] });
+    await waitFor(() => expect(dialog.textContent).toContain("1 terminal closed"));
+  });
+
+  it("keeps cleanup failures visible after the last thread leaves Settled", async () => {
+    const pending = deferred<never>();
+    let settled = true;
+    const rendered = renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [thread({ id: "thr_terminal", title: "Last settled thread" })],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        listLifecycle: () => ({ rows: settled ? [{ threadId: "thr_terminal", settledAt: 200, snoozedUntil: null, snoozedAt: null }] : [] }),
+        previewSettledCleanup: () => ({
+          token: "98bb67b5-b58b-4fc4-9a55-34e557dc8f55",
+          threads: [{ threadId: "thr_terminal", title: "Last settled thread", terminalCount: 1, ports: [] }],
+          skipped: [],
+        }),
+        cleanSettled: () => pending.promise,
+      },
+    });
+    const shelf = await screen.findByRole("region", { name: "Settled" });
+    fireEvent.click(within(shelf).getByRole("button", { name: "Clean settled resources" }));
+    const dialog = await screen.findByRole("dialog", { name: "Clean settled resources?" });
+    fireEvent.click(await within(dialog).findByRole("button", { name: "Clean resources" }));
+    await within(dialog).findByRole("button", { name: "Cleaning..." });
+
+    settled = false;
+    await rendered.emitRealtime("lifecycle", {});
+    await waitFor(() => expect(shelf.hidden).toBe(true));
+    expect(screen.getByRole("dialog", { name: "Clean settled resources?" })).toBe(dialog);
+
+    await act(async () => pending.reject(new Error("Cleanup connection lost")));
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("Cleanup connection lost");
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveProperty("disabled", false);
+  });
+
   it("moves a settled thread to the Settled shelf", async () => {
     renderSlot(inbox, listProps, {
       sidebarThreads: {
@@ -4110,7 +4298,7 @@ describe("parking threads", () => {
     expect(within(shelf).getByText(/Settled \(1\)/)).toBeDefined();
     // Collapsed by default: parked work is out of the way, never gone.
     expect(screen.queryByText("Finished work")).toBeNull();
-    fireEvent.click(within(shelf).getByRole("button"));
+    fireEvent.click(within(shelf).getByRole("button", { expanded: false }));
     expect(within(shelf).getByText("Finished work")).toBeDefined();
     expect(
       within(shelf).getByRole("listitem").textContent,
@@ -4297,6 +4485,282 @@ describe("parking threads", () => {
         snoozedUntil: expect.any(Number),
       }),
     );
+  });
+
+  it.each([false, true])(
+    "folds working threads to one line only when the experiment is on (%s)",
+    async (compactWorkingThreads) => {
+      renderSlot(inbox, listProps, {
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            thread({ id: "busy", title: "Busy work", indicator: "runtime", indicatorLabel: "Working" }),
+            thread({ id: "asking", title: "Asking work", indicator: "runtime", hasPendingInteraction: true }),
+            thread({ id: "idle", title: "Idle work" }),
+          ],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+        },
+        rpc: {
+          // Fixture threads are old; keep them all in Active.
+          getSidebarSettings: () => ({
+            ...defaultSidebarSettings,
+            inactiveThreadsEnabled: false,
+            compactWorkingThreads,
+          }),
+          listLifecycle: () => ({ rows: [] }),
+        },
+      });
+      const card = (title: string) =>
+        screen.getByRole("link", { name: title }).closest("[data-parent-card]")!;
+      await screen.findByRole("link", { name: "Busy work" });
+
+      await waitFor(() =>
+        expect(card("Busy work").classList.contains("h-8")).toBe(compactWorkingThreads),
+      );
+      expect(card("Asking work").classList.contains("h-8")).toBe(false);
+      expect(card("Idle work").classList.contains("h-8")).toBe(false);
+      // The folded row keeps bb's spinner and the full label for screen readers.
+      expect(card("Busy work").querySelector('[data-icon="Loading"]') !== null).toBe(
+        compactWorkingThreads,
+      );
+      expect(within(card("Busy work") as HTMLElement).getByText("Working")).toBeDefined();
+    },
+  );
+
+  it.each([false, true])(
+    "keeps a compact row's working children folded until expanded (compact %s)",
+    async (compactWorkingThreads) => {
+      renderSlot(inbox, listProps, {
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            thread({ id: "parent", title: "Parent work", indicator: "runtime" }),
+            thread({ id: "child", parentThreadId: "parent", title: "Child work", indicator: "runtime" }),
+          ],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+        },
+        rpc: {
+          getSidebarSettings: () => ({
+            ...defaultSidebarSettings,
+            inactiveThreadsEnabled: false,
+            showRunningChildrenWhenCollapsed: true,
+            compactWorkingThreads,
+          }),
+          listLifecycle: () => ({ rows: [] }),
+        },
+      });
+      await screen.findByRole("link", { name: "Parent work" });
+      // The full card surfaces a working child; the one-line row does not.
+      await waitFor(() =>
+        expect(screen.queryByText("Child work") === null).toBe(compactWorkingThreads),
+      );
+
+      if (compactWorkingThreads) {
+        fireEvent.click(screen.getByRole("button", { name: /1 child thread/ }));
+        expect(await screen.findByText("Child work")).toBeDefined();
+      }
+    },
+  );
+
+  it("keeps a row compact until its children and agents are done", async () => {
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [
+          thread({ id: "waiting-on-child", title: "Waiting on child" }),
+          thread({ id: "child", parentThreadId: "waiting-on-child", title: "Child work", indicator: "runtime" }),
+          thread({ id: "asking", title: "Asking parent", hasPendingInteraction: true }),
+          thread({ id: "asking-child", parentThreadId: "asking", title: "Asking child", indicator: "runtime" }),
+          thread({
+            id: "agent",
+            title: "Agent parent",
+            activity: { workflows: 0, backgroundAgents: 1, backgroundCommands: 0, planMode: 0, goals: 0 },
+          }),
+          thread({ id: "done", title: "Done parent" }),
+          thread({ id: "done-child", parentThreadId: "done", title: "Done child" }),
+        ],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        getSidebarSettings: () => ({
+          ...defaultSidebarSettings,
+          inactiveThreadsEnabled: false,
+          compactWorkingThreads: true,
+        }),
+        listLifecycle: () => ({ rows: [] }),
+      },
+    });
+    const isCompact = (title: string) =>
+      screen
+        .getByRole("link", { name: title })
+        .closest("[data-parent-card]")!
+        .classList.contains("h-8");
+    await screen.findByRole("link", { name: "Waiting on child" });
+
+    await waitFor(() => expect(isCompact("Waiting on child")).toBe(true));
+    expect(isCompact("Agent parent")).toBe(true);
+    // The parent's own question outranks its children's work.
+    expect(isCompact("Asking parent")).toBe(false);
+    expect(isCompact("Done parent")).toBe(false);
+  });
+
+  it("counts live descendants despite unread success and keeps requests for input in Active", () => {
+    const parent = thread({ id: "parent" });
+    const liveChild = thread({ id: "child", parentThreadId: "parent", indicator: "unread-success", status: "active" });
+    expect(isWorkingTree(parent, [liveChild], new Map())).toBe(true);
+    const askingParent = thread({ id: "asking", indicator: "waiting-for-input", activity: {
+      workflows: 0, backgroundAgents: 1, backgroundCommands: 0, planMode: 0, goals: 0,
+    } });
+    expect(isWorkingTree(askingParent, [], new Map())).toBe(false);
+  });
+
+  it("keeps Unpin clickable on a parent compacted by child work", async () => {
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [
+          thread({ id: "parent", title: "Pinned parent", isPinned: true }),
+          thread({ id: "child", parentThreadId: "parent", indicator: "runtime" }),
+        ],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: {
+        getSidebarSettings: () => ({ ...defaultSidebarSettings, compactWorkingThreads: true }),
+        listLifecycle: () => ({ rows: [] }),
+      },
+    });
+    const button = await screen.findByRole("button", { name: "Unpin Pinned parent" });
+    expect(button.classList.contains("pointer-events-auto")).toBe(true);
+  });
+
+  it.each([true, false])(
+    "moves threads with work running under them to a Working shelf (enabled %s)",
+    async (workingShelf) => {
+      renderSlot(inbox, listProps, {
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            thread({ id: "busy", title: "Busy work", indicator: "runtime" }),
+            thread({ id: "waiting", title: "Waiting on child" }),
+            thread({ id: "child", parentThreadId: "waiting", title: "Child work", indicator: "runtime" }),
+            thread({ id: "asking", title: "Asking parent", hasPendingInteraction: true }),
+            thread({ id: "asking-child", parentThreadId: "asking", title: "Asking child", indicator: "runtime" }),
+            thread({ id: "done", title: "Done work", indicator: "unread-success", isUnread: true }),
+            thread({ id: "pinned", title: "Pinned busy", indicator: "runtime", isPinned: true }),
+          ],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+        },
+        rpc: {
+          getSidebarSettings: () => ({
+            ...defaultSidebarSettings,
+            inactiveThreadsEnabled: false,
+            workingShelf,
+          }),
+          listLifecycle: () => ({ rows: [] }),
+        },
+      });
+      await screen.findByRole("link", { name: "Busy work" });
+      const titlesIn = (name: string) =>
+        within(screen.getByRole("region", { name }))
+          .getAllByRole("link")
+          .map((link) => link.getAttribute("aria-label"));
+
+      if (!workingShelf) {
+        await waitFor(() => expect(titlesIn("Active")).toContain("Busy work"));
+        expect(screen.queryByRole("region", { name: "Working" })).toBeNull();
+        return;
+      }
+      await waitFor(() =>
+        expect(titlesIn("Working")).toEqual(["Busy work", "Waiting on child"]),
+      );
+      // Done, or needing you, is Active's business; pinned stays pinned.
+      expect(titlesIn("Active")).toEqual(["Asking parent", "Done work"]);
+      expect(titlesIn("Pinned")).toEqual(["Pinned busy"]);
+      // One line like the other shelves, even with compact mode off.
+      for (const title of ["Busy work", "Waiting on child"]) {
+        expect(
+          screen
+            .getByRole("link", { name: title })
+            .closest("[data-parent-card]")!
+            .classList.contains("h-8"),
+        ).toBe(true);
+      }
+    },
+  );
+
+  it.each([true, false])(
+    "docks the shelves after Active to the bottom when enabled (%s)",
+    async (dockShelves) => {
+      renderSlot(inbox, listProps, {
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            thread({ id: "open", title: "Open work" }),
+            thread({ id: "done", title: "Settled work" }),
+          ],
+          projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+        },
+        rpc: {
+          getSidebarSettings: () => ({
+            ...defaultSidebarSettings,
+            inactiveThreadsEnabled: false,
+            dockShelves,
+          }),
+          listLifecycle: () => ({ rows: [{
+            threadId: "done", settledAt: Date.now(), settledOverride: "settled",
+            snoozedUntil: null, snoozedAt: null,
+          }] }),
+        },
+      });
+      const settled = await screen.findByRole("region", { name: "Settled" });
+      const active = screen.getByRole("region", { name: "Active" });
+      await waitFor(() =>
+        expect(settled.closest("[data-shelf-dock]") !== null).toBe(dockShelves),
+      );
+      // Active never moves into the dock; it scrolls in the space above.
+      expect(active.closest("[data-shelf-dock]")).toBeNull();
+    },
+  );
+
+  it("snoozes to a picked date and time from the snooze menu", async () => {
+    const snooze = vi.fn(() => ({ ok: true }));
+    renderSlot(inbox, listProps, {
+      sidebarThreads: {
+        status: "ready",
+        threads: [thread({ id: "thr_pick", title: "Later work" })],
+        projects: [{ id: "proj_1", name: "bb", isPersonal: false, href: "", settingsHref: "" }],
+      },
+      rpc: { listLifecycle: () => ({ rows: [] }), snooze },
+    });
+
+    fireEvent.keyDown(
+      await screen.findByRole("combobox", { name: "Snooze thread" }),
+      { key: "Enter" },
+    );
+    fireEvent.click(await screen.findByRole("option", { name: "Pick date & time…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Snooze until" });
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    expect(within(dialog).getByText(/^Wakes /)).toBeDefined();
+
+    const time = within(dialog).getByLabelText("Time");
+    fireEvent.change(time, { target: { value: "" } });
+    expect(within(dialog).getByText("Enter a time.")).toBeDefined();
+    expect(
+      within(dialog).getByRole("button", { name: "Snooze" }).hasAttribute("disabled"),
+    ).toBe(true);
+
+    fireEvent.change(time, { target: { value: "16:45" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Snooze" }));
+    await waitFor(() =>
+      expect(snooze).toHaveBeenCalledWith({
+        threadId: "thr_pick",
+        snoozedUntil: new Date(
+          tomorrow.getFullYear(), tomorrow.getMonth(), tomorrow.getDate(), 16, 45,
+        ).getTime(),
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   // jsdom cannot evaluate `@media (hover: none)`, so the regression this
@@ -4556,7 +5020,7 @@ describe("parking threads", () => {
     });
 
     const shelf = await screen.findByRole("region", { name: "Settled" });
-    fireEvent.click(within(shelf).getByRole("button"));
+    fireEvent.click(within(shelf).getByRole("button", { expanded: false }));
     const row = within(shelf).getByText("Settled failure").closest("li")!;
     expect(within(row).getByText("Failed").className).toContain(
       "text-[color:var(--bb-sidebar-tone-error)]",
@@ -4665,7 +5129,7 @@ describe("parking threads", () => {
       within(activeShelf).getByRole("button", { expanded: true }),
     );
     fireEvent.click(within(inactiveShelf).getByRole("button"));
-    fireEvent.click(within(settledShelf).getByRole("button"));
+    fireEvent.click(within(settledShelf).getByRole("button", { expanded: false }));
     fireEvent.click(within(snoozedShelf).getByRole("button"));
     expect(within(activeShelf).queryByText("Active work")).toBeNull();
     expect(within(inactiveShelf).getByText("Inactive work")).toBeDefined();
@@ -4818,7 +5282,7 @@ describe("parking threads", () => {
     const snoozedShelf = await screen.findByRole("region", { name: "Snoozed" });
     const settledShelf = await screen.findByRole("region", { name: "Settled" });
     fireEvent.click(within(snoozedShelf).getByRole("button"));
-    fireEvent.click(within(settledShelf).getByRole("button"));
+    fireEvent.click(within(settledShelf).getByRole("button", { expanded: false }));
     expect(
       within(snoozedShelf).getAllByRole("listitem").map((row) => row.textContent),
     ).toEqual([expect.stringContaining("Sooner wake"), expect.stringContaining("Later wake")]);
@@ -4850,7 +5314,7 @@ describe("parking threads", () => {
     });
 
     const shelf = await screen.findByRole("region", { name: "Settled" });
-    fireEvent.click(within(shelf).getByRole("button"));
+    fireEvent.click(within(shelf).getByRole("button", { expanded: false }));
     expect(within(shelf).getAllByRole("listitem")).toHaveLength(10);
     fireEvent.click(within(shelf).getByRole("button", { name: "Load 25 more" }));
     expect(within(shelf).getAllByRole("listitem")).toHaveLength(35);
@@ -5074,9 +5538,9 @@ describe("row context menu", () => {
       "Parent",
       "Project",
       "Pin",
+      "Snooze",
       "Park thread",
       "Settle",
-      "Snooze",
       "Rename",
       "Regenerate title",
       "Mark unread",
@@ -5647,7 +6111,7 @@ describe("row context menu", () => {
     });
 
     const shelf = await screen.findByRole("region", { name: "Snoozed" });
-    fireEvent.click(within(shelf).getByRole("button"));
+    fireEvent.click(within(shelf).getByRole("button", { expanded: false }));
     fireEvent.click(within(shelf).getByLabelText("Wake thread now"));
     await waitFor(() =>
       expect(toastMocks.success).toHaveBeenCalledWith(
@@ -5751,7 +6215,7 @@ describe("row context menu", () => {
     );
     const settledShelf = await screen.findByRole("region", { name: "Settled" });
     const snoozedShelf = await screen.findByRole("region", { name: "Snoozed" });
-    fireEvent.click(within(settledShelf).getByRole("button"));
+    fireEvent.click(within(settledShelf).getByRole("button", { expanded: false }));
     fireEvent.click(within(snoozedShelf).getByRole("button"));
 
     fireEvent.contextMenu(within(settledShelf).getByText("Settled row"));
